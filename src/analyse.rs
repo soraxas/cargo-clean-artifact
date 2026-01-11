@@ -23,6 +23,10 @@ pub(crate) struct AnalyseCommand {
     /// Target flavors to inspect, comma-separated (e.g. debug,release).
     #[clap(long, default_value = "debug,release", value_delimiter = ',')]
     flavors: Vec<String>,
+
+    /// Show every artifact entry instead of a collapsed summary.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    full: bool,
 }
 
 #[derive(Clone)]
@@ -116,7 +120,7 @@ impl AnalyseCommand {
             }
         }
 
-        print_analysis(&usages);
+        print_analysis(&usages, self.full);
 
         Ok(())
     }
@@ -178,11 +182,16 @@ async fn analyze_dep_file(
     Ok(artifacts)
 }
 
-fn print_analysis(usages: &[ArtifactUsage]) {
+fn print_analysis(usages: &[ArtifactUsage], full: bool) {
     let color = std::io::stdout().is_terminal();
     let headline_style = Style::new().fg_color(Some(AnsiColor::Green.into())).bold();
     let accent_style = Style::new().fg_color(Some(AnsiColor::Cyan.into()));
-    let unused_style = Style::new().fg_color(Some(AnsiColor::Yellow.into()));
+    let unused_style = Style::new().fg_color(Some(AnsiColor::Yellow.into())).bold();
+    let count_style = Style::new()
+        .fg_color(Some(AnsiColor::Magenta.into()))
+        .bold();
+    let flavor_style = Style::new().fg_color(Some(AnsiColor::Blue.into()));
+    let path_style = Style::new().fg_color(Some(AnsiColor::White.into()));
 
     println!(
         "{} {} artifacts",
@@ -215,32 +224,106 @@ fn print_analysis(usages: &[ArtifactUsage]) {
             paint(color, format_bytes(total_size), accent_style)
         );
 
-        for usage in group {
-            let used_by = if usage.used_by.is_empty() {
-                paint(color, "unused", unused_style)
-            } else {
-                let mut names: Vec<String> = usage
-                    .used_by
-                    .iter()
-                    .map(|p| {
-                        if p.features.is_empty() {
-                            p.name.clone()
-                        } else {
-                            format!("{}[{}]", p.name, p.features.join(","))
-                        }
-                    })
-                    .collect();
-                names.sort();
-                names.join(", ")
-            };
+        if full {
+            // Collapse identical entries (same flavor/path/used_by).
+            let mut collapsed: HashMap<(String, PathBuf, String), (u64, usize)> = HashMap::new();
 
-            println!(
-                "  [{}] {} ({}) -> {}",
-                paint(color, &usage.flavor, accent_style),
-                usage.path.display(),
-                paint(color, format_bytes(usage.size), accent_style),
-                used_by
-            );
+            for usage in group {
+                let used_by_key = used_by_key(&usage.used_by);
+                let key = (usage.flavor.clone(), usage.path.clone(), used_by_key);
+                collapsed
+                    .entry(key)
+                    .and_modify(|entry| entry.1 += 1)
+                    .or_insert((usage.size, 1));
+            }
+
+            let mut collapsed_entries: Vec<_> = collapsed.into_iter().collect();
+            collapsed_entries.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+
+            for ((flavor, path, used_by_key), (size, count)) in collapsed_entries {
+                let used_by = display_used_by(
+                    color,
+                    &parse_used_by_key(&used_by_key),
+                    unused_style,
+                    accent_style,
+                );
+                let count_text = if count > 1 {
+                    format!(
+                        "{} (x{} total {})",
+                        format_bytes(size),
+                        paint(color, count.to_string(), count_style),
+                        format_bytes(size * count as u64)
+                    )
+                } else {
+                    format_bytes(size)
+                };
+
+                println!(
+                    "  {} {} ({}) -> {}",
+                    paint(color, format!("[{}]", flavor), flavor_style),
+                    paint(color, format!("{}", path.display()), path_style),
+                    paint(color, count_text, accent_style),
+                    used_by
+                );
+            }
         }
+    }
+}
+
+fn used_by_key(used_by: &[PackageUsage]) -> String {
+    let mut names: Vec<String> = used_by
+        .iter()
+        .map(|p| {
+            if p.features.is_empty() {
+                p.name.clone()
+            } else {
+                format!("{}[{}]", p.name, p.features.join(","))
+            }
+        })
+        .collect();
+    names.sort();
+    names.join(", ")
+}
+
+fn parse_used_by_key(s: &str) -> Vec<PackageUsage> {
+    if s.is_empty() {
+        return vec![];
+    }
+    s.split(", ")
+        .map(|entry| {
+            if let Some((name, feat)) = entry.split_once('[') {
+                let feat = feat.trim_end_matches(']');
+                let features = if feat.is_empty() {
+                    vec![]
+                } else {
+                    feat.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect()
+                };
+                PackageUsage {
+                    name: name.to_string(),
+                    features,
+                }
+            } else {
+                PackageUsage {
+                    name: entry.to_string(),
+                    features: vec![],
+                }
+            }
+        })
+        .collect()
+}
+
+fn display_used_by(
+    color: bool,
+    used_by: &[PackageUsage],
+    unused_style: Style,
+    accent_style: Style,
+) -> String {
+    if used_by.is_empty() {
+        paint(color, "unused", unused_style)
+    } else {
+        paint(color, used_by_key(used_by), accent_style)
     }
 }
