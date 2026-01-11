@@ -37,11 +37,12 @@ pub(crate) struct CleanCommand {
     dir: PathBuf,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub(super) struct CleanupStats {
     pub(super) files: usize,
     pub(super) bytes: u64,
     pub(super) per_crate: HashMap<String, CrateStat>,
+    pub(super) errors: HashMap<(String, String, String), anyhow::Error>,
 }
 
 #[derive(Default, Clone)]
@@ -59,6 +60,7 @@ impl CleanupStats {
             entry.files += stat.files;
             entry.bytes += stat.bytes;
         }
+        self.errors.extend(other.errors);
     }
 }
 
@@ -154,6 +156,8 @@ impl CleanCommand {
             ))?;
         let mut stats = CleanupStats::default();
 
+        let dry_run = self.dry_run;
+
         for dep in dep_files {
             // Skip dep files that touch used package dirs.
             if dep.map.values().any(|deps| {
@@ -186,24 +190,38 @@ impl CleanCommand {
                 let size = fs::metadata(file).await.map(|m| m.len()).unwrap_or(0);
                 let crate_key = crate_key(file);
 
-                if !self.is_dry_run() {
-                    let _ = fs::remove_file(file).await;
+                fn update_stats(stats: &mut CleanupStats, crate_key: &str, size: u64) {
+                    stats.files += 1;
+                    stats.bytes += size;
+                    let entry = stats.per_crate.entry(crate_key.to_string()).or_default();
+                    entry.files += 1;
+                    entry.bytes += size;
                 }
 
-                stats.files += 1;
-                stats.bytes += size;
-
-                let entry = stats.per_crate.entry(crate_key).or_default();
-                entry.files += 1;
-                entry.bytes += size;
+                if dry_run {
+                    println!("Would remove {}", file.display());
+                    update_stats(&mut stats, &crate_key, size);
+                } else {
+                    match fs::remove_file(file).await {
+                        Ok(_) => {
+                            update_stats(&mut stats, &crate_key, size);
+                        }
+                        Err(e) => {
+                            stats.errors.insert(
+                                (
+                                    crate_key.clone(),
+                                    flavor.to_string(),
+                                    file.display().to_string(),
+                                ),
+                                e.into(),
+                            );
+                        }
+                    };
+                }
             }
         }
 
         Ok(stats)
-    }
-
-    fn is_dry_run(&self) -> bool {
-        !self.yes || self.dry_run
     }
 
     pub async fn run(self) -> Result<()> {
@@ -233,7 +251,7 @@ impl CleanCommand {
 
         let total_stats = remove_unused_files.await?;
 
-        print_summary(self.is_dry_run(), &total_stats);
+        print_summary(!self.yes, &total_stats);
 
         Ok(())
     }
@@ -299,7 +317,7 @@ fn paint(enabled: bool, text: impl AsRef<str>, style: Style) -> String {
 
 fn print_summary(dry_run: bool, total_stats: &CleanupStats) {
     let mut crates: Vec<_> = total_stats.per_crate.iter().collect();
-    crates.sort_by_key(|(_, stat)| std::cmp::Reverse(stat.bytes));
+    crates.sort_by_key(|(name, stat)| (std::cmp::Reverse(stat.bytes), name.to_string()));
 
     let color = std::io::stdout().is_terminal();
     let headline_style = Style::new().fg_color(Some(if dry_run {
@@ -328,8 +346,9 @@ fn print_summary(dry_run: bool, total_stats: &CleanupStats) {
     };
 
     println!("{headline}");
+    const MAX_CRATES: usize = 20;
 
-    for (name, stat) in crates.iter().take(20) {
+    for (name, stat) in crates.iter().take(MAX_CRATES) {
         println!(
             "- {}: {} files ({})",
             paint(color, name.to_string(), accent_style),
@@ -338,10 +357,38 @@ fn print_summary(dry_run: bool, total_stats: &CleanupStats) {
         );
     }
 
-    if crates.len() > 20 {
+    if crates.len() > MAX_CRATES {
         println!(
             "... and {} more crates",
             paint(color, (crates.len() - 20).to_string(), accent_style)
         );
+    }
+
+    if !total_stats.errors.is_empty() {
+        let error_headline_style = Style::new().fg_color(Some(AnsiColor::Red.into())).bold();
+        let error_accent_style = Style::new().fg_color(Some(AnsiColor::Cyan.into()));
+        let error_crate_style = Style::new().fg_color(Some(AnsiColor::Yellow.into()));
+        let error_flavor_style = Style::new().fg_color(Some(AnsiColor::Magenta.into()));
+        let error_file_style = Style::new().fg_color(Some(AnsiColor::Blue.into()));
+
+        println!(
+            "\n{} {}",
+            paint(color, "Errors:", error_headline_style),
+            paint(
+                color,
+                format!("({} crates)", total_stats.errors.len()),
+                error_accent_style
+            )
+        );
+        for ((crate_name, flavor, file), error) in total_stats.errors.iter() {
+            println!(
+                "  {} [{}]: {} -> {}",
+                paint(color, crate_name, error_crate_style),
+                paint(color, flavor, error_flavor_style),
+                paint(color, file, error_file_style),
+                paint(color, format!("{}", error), error_headline_style),
+            );
+        }
+        println!(); // Add a trailing blank for separation
     }
 }
