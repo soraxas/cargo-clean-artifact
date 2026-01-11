@@ -1,9 +1,7 @@
+use crate::clean::CleanCommand;
+use crate::git::CleanGitCommand;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-
-use self::clean::{CleanCommand, CleanGitCommand};
-
-mod clean;
 
 #[derive(Debug, Parser)]
 #[command(

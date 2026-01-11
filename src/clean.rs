@@ -1,14 +1,41 @@
 use std::{
     collections::HashMap,
+    io::IsTerminal,
     path::{Path, PathBuf},
 };
 
+use anstyle::{AnsiColor, Reset, Style};
 use anyhow::{Context, Result};
 use cargo_metadata::{CargoOpt, MetadataCommand};
-use futures::try_join;
+use clap::ArgAction;
+use clap::{Args, ValueHint};
+use futures::{future::try_join_all, try_join};
 use tokio::fs;
 
-use super::CleanCommand;
+/// Clean unused, old project files.
+///
+/// 1. This removes
+///
+///  - the unused files in `target` directory.
+#[derive(Debug, Args)]
+pub(crate) struct CleanCommand {
+    /// Actually remove files (dry-run is the default).
+    #[clap(short = 'y', long = "yes")]
+    yes: bool,
+
+    /// Force dry-run mode (default behavior).
+    #[clap(long, action = ArgAction::SetTrue)]
+    dry_run: bool,
+
+    /// The directory to clean.
+    ///
+    #[clap(
+        value_hint = ValueHint::DirPath,
+        default_value = ".",
+        value_name = "DIR"
+    )]
+    dir: PathBuf,
+}
 
 #[derive(Default, Clone)]
 pub(super) struct CleanupStats {
@@ -174,6 +201,42 @@ impl CleanCommand {
 
         Ok(stats)
     }
+
+    fn is_dry_run(&self) -> bool {
+        !self.yes || self.dry_run
+    }
+
+    pub async fn run(self) -> Result<()> {
+        // todo: recursively find all git projects in the directory
+        let dirs = vec![self.dir.clone()];
+
+        let remove_unused_files = async {
+            let stats = try_join_all(dirs.iter().map(async |dir| {
+                self.remove_unused_files_of_cargo(&dir.as_path())
+                    .await
+                    .with_context(|| {
+                        format!("failed to clean up unused files in {}", dir.display())
+                    })
+            }))
+            .await
+            .context("failed to clean up unused files")?;
+
+            let total = stats
+                .into_iter()
+                .fold(CleanupStats::default(), |mut acc, s| {
+                    acc.merge_from(s);
+                    acc
+                });
+
+            Ok::<_, anyhow::Error>(total)
+        };
+
+        let total_stats = remove_unused_files.await?;
+
+        print_summary(self.is_dry_run(), &total_stats);
+
+        Ok(())
+    }
 }
 
 fn crate_key(path: &Path) -> String {
@@ -225,4 +288,60 @@ fn parse_dep_file(s: &str) -> Result<DepFile> {
         .collect();
 
     Ok(DepFile { map: entries })
+}
+
+fn paint(enabled: bool, text: impl AsRef<str>, style: Style) -> String {
+    if !enabled {
+        return text.as_ref().to_string();
+    }
+    format!("{style}{}{}", text.as_ref(), Reset)
+}
+
+fn print_summary(dry_run: bool, total_stats: &CleanupStats) {
+    let mut crates: Vec<_> = total_stats.per_crate.iter().collect();
+    crates.sort_by_key(|(_, stat)| std::cmp::Reverse(stat.bytes));
+
+    let color = std::io::stdout().is_terminal();
+    let headline_style = Style::new().fg_color(Some(if dry_run {
+        AnsiColor::Yellow.into()
+    } else {
+        AnsiColor::Green.into()
+    }));
+    let accent_style = Style::new().fg_color(Some(AnsiColor::Cyan.into()));
+
+    let headline = if dry_run {
+        format!(
+            "{} would remove {} files ({}) across {} crates",
+            paint(color, "Dry-run:", headline_style),
+            paint(color, total_stats.files.to_string(), accent_style),
+            paint(color, format_bytes(total_stats.bytes), accent_style),
+            paint(color, crates.len().to_string(), accent_style),
+        )
+    } else {
+        format!(
+            "{} {} files ({}) across {} crates",
+            paint(color, "Removed", headline_style),
+            paint(color, total_stats.files.to_string(), accent_style),
+            paint(color, format_bytes(total_stats.bytes), accent_style),
+            paint(color, crates.len().to_string(), accent_style),
+        )
+    };
+
+    println!("{headline}");
+
+    for (name, stat) in crates.iter().take(20) {
+        println!(
+            "- {}: {} files ({})",
+            paint(color, name.to_string(), accent_style),
+            paint(color, stat.files.to_string(), accent_style),
+            paint(color, format_bytes(stat.bytes), accent_style)
+        );
+    }
+
+    if crates.len() > 20 {
+        println!(
+            "... and {} more crates",
+            paint(color, (crates.len() - 20).to_string(), accent_style)
+        );
+    }
 }

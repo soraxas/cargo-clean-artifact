@@ -3,39 +3,10 @@ use std::{
     process::Stdio,
 };
 
-use anstyle::{AnsiColor, Reset, Style};
 use anyhow::{Context, Result};
 use clap::{ArgAction, Args, ValueHint};
 use futures::future::try_join_all;
-use std::io::IsTerminal;
 use tokio::process::Command;
-
-mod cargo;
-
-/// Clean unused, old project files.
-///
-/// 1. This removes
-///
-///  - the unused files in `target` directory.
-#[derive(Debug, Args)]
-pub(crate) struct CleanCommand {
-    /// Actually remove files (dry-run is the default).
-    #[clap(short = 'y', long = "yes")]
-    yes: bool,
-
-    /// Force dry-run mode (default behavior).
-    #[clap(long, action = ArgAction::SetTrue)]
-    dry_run: bool,
-
-    /// The directory to clean.
-    ///
-    #[clap(
-        value_hint = ValueHint::DirPath,
-        default_value = ".",
-        value_name = "DIR"
-    )]
-    dir: PathBuf,
-}
 
 /// Remove gone local git branches.
 #[derive(Debug, Args)]
@@ -59,46 +30,6 @@ pub(crate) struct CleanGitCommand {
     /// Run `git fetch --all` before pruning.
     #[clap(long, default_value_t = true, action = ArgAction::Set)]
     fetch: bool,
-}
-
-impl CleanCommand {
-    fn is_dry_run(&self) -> bool {
-        !self.yes || self.dry_run
-    }
-
-    pub async fn run(self) -> Result<()> {
-        let git_projects = find_git_projects(&self.dir)
-            .await
-            .with_context(|| format!("failed to find git projects from {}", self.dir.display()))?;
-
-        let remove_unused_files = async {
-            let stats = try_join_all(git_projects.iter().map(|git_dir| async {
-                self.remove_unused_files_of_cargo(git_dir)
-                    .await
-                    .context(format!(
-                        "failed to clean up unused files in {}",
-                        git_dir.display()
-                    ))
-            }))
-            .await
-            .context("failed to clean up unused files")?;
-
-            let total = stats
-                .into_iter()
-                .fold(cargo::CleanupStats::default(), |mut acc, s| {
-                    acc.merge_from(s);
-                    acc
-                });
-
-            Ok::<_, anyhow::Error>(total)
-        };
-
-        let total_stats = remove_unused_files.await?;
-
-        print_summary(self.is_dry_run(), &total_stats);
-
-        Ok(())
-    }
 }
 
 impl CleanGitCommand {
@@ -136,62 +67,6 @@ impl CleanGitCommand {
 
         Ok(())
     }
-}
-
-fn print_summary(dry_run: bool, total_stats: &cargo::CleanupStats) {
-    let mut crates: Vec<_> = total_stats.per_crate.iter().collect();
-    crates.sort_by_key(|(_, stat)| std::cmp::Reverse(stat.bytes));
-
-    let color = std::io::stdout().is_terminal();
-    let headline_style = Style::new().fg_color(Some(if dry_run {
-        AnsiColor::Yellow.into()
-    } else {
-        AnsiColor::Green.into()
-    }));
-    let accent_style = Style::new().fg_color(Some(AnsiColor::Cyan.into()));
-
-    let headline = if dry_run {
-        format!(
-            "{} would remove {} files ({}) across {} crates",
-            paint(color, "Dry-run:", headline_style),
-            paint(color, total_stats.files.to_string(), accent_style),
-            paint(color, cargo::format_bytes(total_stats.bytes), accent_style),
-            paint(color, crates.len().to_string(), accent_style),
-        )
-    } else {
-        format!(
-            "{} {} files ({}) across {} crates",
-            paint(color, "Removed", headline_style),
-            paint(color, total_stats.files.to_string(), accent_style),
-            paint(color, cargo::format_bytes(total_stats.bytes), accent_style),
-            paint(color, crates.len().to_string(), accent_style),
-        )
-    };
-
-    println!("{headline}");
-
-    for (name, stat) in crates.iter().take(20) {
-        println!(
-            "- {}: {} files ({})",
-            paint(color, name.to_string(), accent_style),
-            paint(color, stat.files.to_string(), accent_style),
-            paint(color, cargo::format_bytes(stat.bytes), accent_style)
-        );
-    }
-
-    if crates.len() > 20 {
-        println!(
-            "... and {} more crates",
-            paint(color, (crates.len() - 20).to_string(), accent_style)
-        );
-    }
-}
-
-fn paint(enabled: bool, text: impl AsRef<str>, style: Style) -> String {
-    if !enabled {
-        return text.as_ref().to_string();
-    }
-    format!("{style}{}{}", text.as_ref(), Reset)
 }
 
 async fn find_git_projects(dir: &Path) -> Result<Vec<PathBuf>> {

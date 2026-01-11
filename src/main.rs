@@ -4,8 +4,9 @@ use log::info;
 
 use crate::cli::CliArgs;
 
+mod clean;
 mod cli;
-mod util;
+mod git;
 
 #[tokio::main]
 
