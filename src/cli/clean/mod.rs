@@ -3,9 +3,11 @@ use std::{
     process::Stdio,
 };
 
+use anstyle::{AnsiColor, Reset, Style};
 use anyhow::{Context, Result};
-use clap::Args;
-use futures::{future::try_join_all, try_join};
+use clap::{ArgAction, Args, ValueHint};
+use futures::future::try_join_all;
+use std::io::IsTerminal;
 use tokio::process::Command;
 
 use crate::util::wrap;
@@ -19,31 +21,96 @@ mod cargo;
 ///  - the unused files in `target` directory.
 #[derive(Debug, Args)]
 pub(crate) struct CleanCommand {
-    #[clap(short, long)]
+    /// Actually remove files (dry-run is the default).
+    #[clap(short = 'y', long = "yes")]
+    yes: bool,
+
+    /// Force dry-run mode (default behavior).
+    #[clap(long, action = ArgAction::SetTrue)]
     dry_run: bool,
 
     /// The directory to clean.
     ///
-    /// If this is a child of a git repository, this command will run `git fetch
-    /// --all` on it and clean only subdirectories.
+    #[clap(
+        value_hint = ValueHint::DirPath,
+        default_value = ".",
+        value_name = "DIR"
+    )]
+    dir: PathBuf,
+}
+
+/// Remove gone local git branches.
+#[derive(Debug, Args)]
+pub(crate) struct CleanGitCommand {
+    /// Actually delete branches (dry-run is default).
+    #[clap(short = 'y', long = "yes")]
+    yes: bool,
+
+    /// Force dry-run.
+    #[clap(long, action = ArgAction::SetTrue)]
+    dry_run: bool,
+
+    /// Directory to search for git repos.
+    #[clap(
+        value_hint = ValueHint::DirPath,
+        default_value = ".",
+        value_name = "DIR"
+    )]
     dir: PathBuf,
 
-    /// If true, ddt remove local git branches which have a remote branch but
-    /// it's removed.
-    ///
-    /// This runs `git fetch --all` on all projects. (does not support
-    /// dry run)
-    #[clap(long)]
-    remove_dead_git_branches: bool,
+    /// Run `git fetch --all` before pruning.
+    #[clap(long, default_value_t = true, action = ArgAction::Set)]
+    fetch: bool,
 }
 
 impl CleanCommand {
+    fn is_dry_run(&self) -> bool {
+        !self.yes || self.dry_run
+    }
+
     pub async fn run(self) -> Result<()> {
         let git_projects = find_git_projects(&self.dir)
             .await
             .with_context(|| format!("failed to find git projects from {}", self.dir.display()))?;
 
-        if self.remove_dead_git_branches {
+        let remove_unused_files = async {
+            let stats = try_join_all(
+                git_projects
+                    .iter()
+                    .map(|git_dir| self.remove_unused_files_of_cargo(git_dir)),
+            )
+            .await
+            .context("failed to clean up unused files")?;
+
+            let total = stats
+                .into_iter()
+                .fold(cargo::CleanupStats::default(), |mut acc, s| {
+                    acc.merge_from(s);
+                    acc
+                });
+
+            Ok::<_, anyhow::Error>(total)
+        };
+
+        let total_stats = remove_unused_files.await?;
+
+        print_summary(self.is_dry_run(), &total_stats);
+
+        Ok(())
+    }
+}
+
+impl CleanGitCommand {
+    fn is_dry_run(&self) -> bool {
+        !self.yes || self.dry_run
+    }
+
+    pub async fn run(self) -> Result<()> {
+        let git_projects = find_git_projects(&self.dir)
+            .await
+            .with_context(|| format!("failed to find git projects from {}", self.dir.display()))?;
+
+        if self.fetch {
             try_join_all(
                 git_projects
                     .iter()
@@ -53,77 +120,74 @@ impl CleanCommand {
             .context("failed to run git fetch step")?;
         }
 
-        let clean_dead_branches = async {
-            try_join_all(
-                git_projects
-                    .iter()
-                    .map(|git_dir| self.remove_dead_branches(git_dir)),
-            )
-            .await
-            .context("failed to clean up dead branches")
-        };
-        let remove_unused_files = async {
-            try_join_all(
-                git_projects
-                    .iter()
-                    .map(|git_dir| self.remove_unused_files_of_cargo(git_dir)),
-            )
-            .await
-            .context("failed to clean up unused files")
-        };
+        let dry_run = self.is_dry_run();
 
-        try_join!(clean_dead_branches, remove_unused_files).context("failed to clean up")?;
+        try_join_all(
+            git_projects
+                .iter()
+                .map(|git_dir| remove_dead_branches(dry_run, git_dir)),
+        )
+        .await
+        .context("failed to clean up dead branches")?;
 
         Ok(())
     }
+}
 
-    async fn remove_dead_branches(&self, git_dir: &Path) -> Result<()> {
-        if !self.remove_dead_git_branches {
-            return Ok(());
-        }
+fn print_summary(dry_run: bool, total_stats: &cargo::CleanupStats) {
+    let mut crates: Vec<_> = total_stats.per_crate.iter().collect();
+    crates.sort_by_key(|(_, stat)| std::cmp::Reverse(stat.bytes));
 
-        wrap(async move {
-            let branches = Command::new("git")
-                .arg("for-each-ref")
-                .arg("--format")
-                .arg("%(refname:short) %(upstream:track)")
-                .current_dir(git_dir)
-                .stderr(Stdio::inherit())
-                .kill_on_drop(true)
-                .output()
-                .await
-                .context("failed to get git refs")?;
+    let color = std::io::stdout().is_terminal();
+    let headline_style = Style::new().fg_color(Some(if dry_run {
+        AnsiColor::Yellow.into()
+    } else {
+        AnsiColor::Green.into()
+    }));
+    let accent_style = Style::new().fg_color(Some(AnsiColor::Cyan.into()));
 
-            let branches = String::from_utf8(branches.stdout)
-                .context("failed to parse output of git refs as utf9")?;
+    let headline = if dry_run {
+        format!(
+            "{} would remove {} files ({}) across {} crates",
+            paint(color, "Dry-run:", headline_style),
+            paint(color, total_stats.files.to_string(), accent_style),
+            paint(color, cargo::format_bytes(total_stats.bytes), accent_style),
+            paint(color, crates.len().to_string(), accent_style),
+        )
+    } else {
+        format!(
+            "{} {} files ({}) across {} crates",
+            paint(color, "Removed", headline_style),
+            paint(color, total_stats.files.to_string(), accent_style),
+            paint(color, cargo::format_bytes(total_stats.bytes), accent_style),
+            paint(color, crates.len().to_string(), accent_style),
+        )
+    };
 
-            for line in branches.lines() {
-                let items = line.split_whitespace().collect::<Vec<_>>();
-                if items.len() == 2 && items[1] == "[gone]" {
-                    let branch = items[0];
+    println!("{headline}");
 
-                    if self.dry_run {
-                        println!("git branch -D {} # dry-run: {}", branch, git_dir.display());
-                    } else {
-                        // TODO: Log status
-                        let _status = Command::new("git")
-                            .arg("branch")
-                            .arg("-D")
-                            .arg(branch)
-                            .current_dir(git_dir)
-                            .kill_on_drop(true)
-                            .status()
-                            .await
-                            .with_context(|| format!("failed to delete branch {}", branch,))?;
-                    }
-                }
-            }
-
-            Ok(())
-        })
-        .await
-        .with_context(|| format!("failed to clean up dead branches in {}", git_dir.display()))
+    for (name, stat) in crates.iter().take(20) {
+        println!(
+            "- {}: {} files ({})",
+            paint(color, name.to_string(), accent_style),
+            paint(color, stat.files.to_string(), accent_style),
+            paint(color, cargo::format_bytes(stat.bytes), accent_style)
+        );
     }
+
+    if crates.len() > 20 {
+        println!(
+            "... and {} more crates",
+            paint(color, (crates.len() - 20).to_string(), accent_style)
+        );
+    }
+}
+
+fn paint(enabled: bool, text: impl AsRef<str>, style: Style) -> String {
+    if !enabled {
+        return text.as_ref().to_string();
+    }
+    format!("{style}{}{}", text.as_ref(), Reset)
 }
 
 async fn find_git_projects(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -152,4 +216,47 @@ async fn run_git_fetch_all(git_dir: &Path) -> Result<()> {
     })?;
 
     Ok(())
+}
+
+async fn remove_dead_branches(dry_run: bool, git_dir: &Path) -> Result<()> {
+    wrap(async move {
+        let branches = Command::new("git")
+            .arg("for-each-ref")
+            .arg("--format")
+            .arg("%(refname:short) %(upstream:track)")
+            .current_dir(git_dir)
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .context("failed to get git refs")?;
+
+        let branches = String::from_utf8(branches.stdout)
+            .context("failed to parse output of git refs as utf9")?;
+
+        for line in branches.lines() {
+            let items = line.split_whitespace().collect::<Vec<_>>();
+            if items.len() == 2 && items[1] == "[gone]" {
+                let branch = items[0];
+
+                if dry_run {
+                    println!("git branch -D {} # dry-run: {}", branch, git_dir.display());
+                } else {
+                    let _status = Command::new("git")
+                        .arg("branch")
+                        .arg("-D")
+                        .arg(branch)
+                        .current_dir(git_dir)
+                        .kill_on_drop(true)
+                        .status()
+                        .await
+                        .with_context(|| format!("failed to delete branch {}", branch,))?;
+                }
+            }
+        }
+
+        Ok(())
+    })
+    .await
+    .with_context(|| format!("failed to clean up dead branches in {}", git_dir.display()))
 }

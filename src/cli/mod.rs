@@ -1,18 +1,19 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use self::{
-    clean::CleanCommand, extra::ExtraCommand, git::GitCommand, solve_version::SolveVersionsCommand,
-};
+use self::clean::{CleanCommand, CleanGitCommand};
 
 mod clean;
-mod extra;
-mod git;
-mod solve_version;
 
 #[derive(Debug, Parser)]
+#[command(
+    name = "cargo-clean-artifact",
+    bin_name = "cargo clean-artifact",
+    about = "Clean old build artifacts / deps that are not used in any features of a workspace."
+)]
 pub struct CliArgs {
-    #[clap(subcommand)]
+    /// Available subcommands.
+    #[command(subcommand)]
     cmd: InnerCmd,
 }
 
@@ -22,13 +23,7 @@ impl CliArgs {
             InnerCmd::Clean(cmd) => {
                 cmd.run().await?;
             }
-            InnerCmd::Git(cmd) => {
-                cmd.run().await?;
-            }
-            InnerCmd::SolveVersions(cmd) => {
-                cmd.run().await?;
-            }
-            InnerCmd::X(cmd) => {
+            InnerCmd::CleanGit(cmd) => {
                 cmd.run().await?;
             }
         }
@@ -39,8 +34,8 @@ impl CliArgs {
 
 #[derive(Debug, Subcommand)]
 enum InnerCmd {
+    /// Clean unused artifacts from cargo target directories.
     Clean(CleanCommand),
-    Git(GitCommand),
-    SolveVersions(SolveVersionsCommand),
-    X(ExtraCommand),
+    /// Remove gone local git branches.
+    CleanGit(CleanGitCommand),
 }
