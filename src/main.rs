@@ -4,8 +4,10 @@ use log::info;
 
 use crate::cli::CliArgs;
 
+mod analyse;
 mod clean;
 mod cli;
+mod crate_deps;
 mod git;
 
 #[tokio::main]

@@ -1,3 +1,4 @@
+use crate::analyse::AnalyseCommand;
 use crate::clean::CleanCommand;
 use crate::git::CleanGitCommand;
 use anyhow::Result;
@@ -24,6 +25,9 @@ impl CliArgs {
             InnerCmd::CleanGit(cmd) => {
                 cmd.run().await?;
             }
+            InnerCmd::Analyse(cmd) => {
+                cmd.run().await?;
+            }
         }
 
         Ok(())
@@ -36,4 +40,6 @@ enum InnerCmd {
     Clean(CleanCommand),
     /// Remove gone local git branches.
     CleanGit(CleanGitCommand),
+    /// Analyze which target artifacts map to which packages/features.
+    Analyse(AnalyseCommand),
 }

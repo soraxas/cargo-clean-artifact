@@ -1,10 +1,11 @@
 use std::{
     collections::HashMap,
+    env,
     io::IsTerminal,
     path::{Path, PathBuf},
 };
 
-use anstyle::{AnsiColor, Reset, Style};
+use anstyle::{AnsiColor, Style};
 use anyhow::{Context, Result};
 use cargo_metadata::{CargoOpt, MetadataCommand};
 use clap::ArgAction;
@@ -12,6 +13,7 @@ use clap::{Args, ValueHint};
 use futures::{future::try_join_all, try_join};
 use tokio::fs;
 
+use crate::crate_deps::{DepFile, crate_key, format_bytes, paint, read_deps_dir};
 /// Clean unused, old project files.
 ///
 /// 1. This removes
@@ -35,6 +37,10 @@ pub(crate) struct CleanCommand {
         value_name = "DIR"
     )]
     dir: PathBuf,
+
+    /// Allow cleaning even when CARGO_TARGET_DIR is set (shared/global cache).
+    #[clap(long, action = ArgAction::SetTrue)]
+    allow_shared_target_dir: bool,
 }
 
 #[derive(Default)]
@@ -61,23 +67,6 @@ impl CleanupStats {
             entry.bytes += stat.bytes;
         }
         self.errors.extend(other.errors);
-    }
-}
-
-pub(super) fn format_bytes(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
-
-    let b = bytes as f64;
-    if b >= GB {
-        format!("{:.2} GiB", b / GB)
-    } else if b >= MB {
-        format!("{:.2} MiB", b / MB)
-    } else if b >= KB {
-        format!("{:.2} KiB", b / KB)
-    } else {
-        format!("{} B", bytes)
     }
 }
 
@@ -136,6 +125,85 @@ impl CleanCommand {
         Ok(total)
     }
 
+    async fn process_dep_file(
+        &self,
+        dep: &DepFile,
+        used_package_dirs: &[PathBuf],
+        target_dir: &Path,
+        dry_run: bool,
+        flavor: &str,
+    ) -> Result<Option<CleanupStats>> {
+        // Skip dep files that touch used package dirs.
+        if dep.map.values().any(|deps| {
+            deps.iter().any(|dep| {
+                dep.ancestors().any(|dir| {
+                    used_package_dirs
+                        .iter()
+                        .any(|used_package_dir| used_package_dir == dir)
+                })
+            })
+        }) {
+            return Ok(None);
+        }
+
+        let mut stats = CleanupStats::default();
+
+        for (file, _) in dep.map.iter() {
+            if file.ancestors().all(|dir| dir != target_dir) {
+                return Ok(None);
+            }
+
+            if let Some(ext) = file.extension() {
+                if ext == "rlib" || ext == "rmeta" {
+                    // We only delete rlib and rmeta
+                } else {
+                    return Ok(None);
+                }
+            } else {
+                return Ok(None);
+            }
+
+            if !fs::try_exists(file).await? {
+                return Ok(None);
+            }
+
+            let size = fs::metadata(file).await.map(|m| m.len()).unwrap_or(0);
+            let crate_key = crate_key(file);
+
+            fn update_stats(stats: &mut CleanupStats, crate_key: &str, size: u64) {
+                stats.files += 1;
+                stats.bytes += size;
+                let entry = stats.per_crate.entry(crate_key.to_string()).or_default();
+                entry.files += 1;
+                entry.bytes += size;
+            }
+
+            if dry_run {
+                println!("Would remove {}", file.display());
+                update_stats(&mut stats, &crate_key, size);
+            } else if self.yes {
+                match fs::remove_file(file).await {
+                    Ok(_) => {
+                        update_stats(&mut stats, &crate_key, size);
+                    }
+                    Err(e) => {
+                        stats.errors.insert(
+                            (
+                                crate_key.clone(),
+                                flavor.to_string(),
+                                file.display().to_string(),
+                            ),
+                            e.into(),
+                        );
+                    }
+                };
+            } else {
+                update_stats(&mut stats, &crate_key, size);
+            }
+        }
+        Ok(Some(stats))
+    }
+
     async fn clean_one_target(
         &self,
         used_package_dirs: &[PathBuf],
@@ -154,77 +222,75 @@ impl CleanCommand {
                 "failed to read cargo deps at {}",
                 base_dir.display()
             ))?;
-        let mut stats = CleanupStats::default();
 
         let dry_run = self.dry_run;
 
-        for dep in dep_files {
-            // Skip dep files that touch used package dirs.
-            if dep.map.values().any(|deps| {
-                deps.iter().any(|dep| {
-                    dep.ancestors().any(|dir| {
-                        used_package_dirs
-                            .iter()
-                            .any(|used_package_dir| used_package_dir == dir)
-                    })
-                })
-            }) {
-                continue;
-            }
+        let mut stats = try_join_all(dep_files.iter().map(async |dep| {
+            self.process_dep_file(dep, used_package_dirs, target_dir, dry_run, flavor)
+                .await
+                .context("failed to process dep file")
+        }))
+        .await
+        .context("failed to process dep files")?;
 
-            for (file, _) in dep.map.iter() {
-                if file.ancestors().all(|dir| dir != target_dir) {
-                    continue;
-                }
+        let total_stats =
+            stats
+                .drain(..)
+                .filter_map(|s| s)
+                .fold(CleanupStats::default(), |mut acc, s| {
+                    acc.merge_from(s);
+                    acc
+                });
 
-                if let Some(ext) = file.extension() {
-                    if ext == "rlib" || ext == "rmeta" {
-                        // We only delete rlib and rmeta
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-
-                let size = fs::metadata(file).await.map(|m| m.len()).unwrap_or(0);
-                let crate_key = crate_key(file);
-
-                fn update_stats(stats: &mut CleanupStats, crate_key: &str, size: u64) {
-                    stats.files += 1;
-                    stats.bytes += size;
-                    let entry = stats.per_crate.entry(crate_key.to_string()).or_default();
-                    entry.files += 1;
-                    entry.bytes += size;
-                }
-
-                if dry_run {
-                    println!("Would remove {}", file.display());
-                    update_stats(&mut stats, &crate_key, size);
-                } else {
-                    match fs::remove_file(file).await {
-                        Ok(_) => {
-                            update_stats(&mut stats, &crate_key, size);
-                        }
-                        Err(e) => {
-                            stats.errors.insert(
-                                (
-                                    crate_key.clone(),
-                                    flavor.to_string(),
-                                    file.display().to_string(),
-                                ),
-                                e.into(),
-                            );
-                        }
-                    };
-                }
-            }
-        }
-
-        Ok(stats)
+        Ok(total_stats)
     }
 
     pub async fn run(self) -> Result<()> {
+        if let Ok(target_dir) = env::var("CARGO_TARGET_DIR") {
+            let color = std::io::stderr().is_terminal();
+            let warn_style = Style::new().fg_color(Some(AnsiColor::Yellow.into())).bold();
+            let accent_style = Style::new().fg_color(Some(AnsiColor::Cyan.into()));
+            let block_style = Style::new().fg_color(Some(AnsiColor::Magenta.into()));
+            let stop_style = Style::new().fg_color(Some(AnsiColor::Red.into())).bold();
+
+            eprintln!(
+                "{} {}",
+                paint(color, "Warning:", warn_style),
+                paint(
+                    color,
+                    format!("CARGO_TARGET_DIR is set to {}", target_dir),
+                    accent_style
+                )
+            );
+            eprintln!(
+                "{}",
+                paint(
+                    color,
+                    "Cleaning a shared/global target may remove artifacts of other workspaces.",
+                    block_style
+                )
+            );
+            if self.allow_shared_target_dir {
+                eprintln!(
+                    "{} {}",
+                    paint(color, "Proceeding because", accent_style),
+                    paint(color, "--allow-shared-target-dir was set.", warn_style)
+                );
+            } else {
+                eprintln!(
+                    "{}",
+                    paint(
+                        color,
+                        "Refusing to proceed without --allow-shared-target-dir.",
+                        stop_style
+                    )
+                );
+                anyhow::bail!(
+                    "CARGO_TARGET_DIR detected; re-run with --allow-shared-target-dir to continue"
+                );
+            }
+        }
+
         // todo: recursively find all git projects in the directory
         let dirs = vec![self.dir.clone()];
 
@@ -255,64 +321,6 @@ impl CleanCommand {
 
         Ok(())
     }
-}
-
-fn crate_key(path: &Path) -> String {
-    let name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-
-    // Strip common prefixes like `lib`.
-    let name = name.strip_prefix("lib").unwrap_or(name);
-
-    // Drop trailing build hash if present: libfoo-<hash>.rlib
-    name.split('-').next().unwrap_or(name).to_string()
-}
-
-/// .d file
-#[derive(Debug)]
-struct DepFile {
-    map: HashMap<PathBuf, Vec<PathBuf>>,
-}
-
-async fn read_deps_dir(dir: &Path) -> Result<Vec<DepFile>> {
-    let mut entries = fs::read_dir(dir).await?;
-    let mut files = vec![];
-
-    while let Some(e) = entries.next_entry().await? {
-        if e.path().extension().map_or(false, |ext| ext == "d") {
-            let content = fs::read_to_string(e.path()).await?;
-            let file = parse_dep_file(&content)?;
-            files.push(file);
-        }
-    }
-
-    Ok(files)
-}
-
-fn parse_dep_file(s: &str) -> Result<DepFile> {
-    let entries = s
-        .lines()
-        .map(|s| s.trim())
-        .filter(|&s| !s.is_empty())
-        .map(|line| line.split_once(':').unwrap())
-        .map(|(k, v)| {
-            (
-                PathBuf::from(k),
-                v.split_whitespace().map(PathBuf::from).collect(),
-            )
-        })
-        .collect();
-
-    Ok(DepFile { map: entries })
-}
-
-fn paint(enabled: bool, text: impl AsRef<str>, style: Style) -> String {
-    if !enabled {
-        return text.as_ref().to_string();
-    }
-    format!("{style}{}{}", text.as_ref(), Reset)
 }
 
 fn print_summary(dry_run: bool, total_stats: &CleanupStats) {
