@@ -1,8 +1,12 @@
-format_strings = true
-group_imports = "StdExternalCrate"
-hex_literal_case = "Lower"
-imports_granularity = "Crate"
-reorder_impl_items = true
 use_field_init_shorthand = true
-wrap_comments = true
-edition = "2018"
+newline_style = "Unix"
+style_edition = "2024"
+# imports_granularity = "Crate"
+
+# The following lines may be uncommented on nightly Rust.
+# Once these features have stabilized, they should be added to the always-enabled options above.
+# unstable_features = true
+# imports_granularity = "Crate"
+# wrap_comments = true
+# comment_width = 100
+# normalize_comments = true

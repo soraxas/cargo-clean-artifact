@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use tracing::info;
+use log::info;
 
 use crate::cli::CliArgs;
 

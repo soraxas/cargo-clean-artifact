@@ -10,8 +10,6 @@ use futures::future::try_join_all;
 use std::io::IsTerminal;
 use tokio::process::Command;
 
-use crate::util::wrap;
-
 mod cargo;
 
 /// Clean unused, old project files.
@@ -74,11 +72,14 @@ impl CleanCommand {
             .with_context(|| format!("failed to find git projects from {}", self.dir.display()))?;
 
         let remove_unused_files = async {
-            let stats = try_join_all(
-                git_projects
-                    .iter()
-                    .map(|git_dir| self.remove_unused_files_of_cargo(git_dir)),
-            )
+            let stats = try_join_all(git_projects.iter().map(|git_dir| async {
+                self.remove_unused_files_of_cargo(git_dir)
+                    .await
+                    .context(format!(
+                        "failed to clean up unused files in {}",
+                        git_dir.display()
+                    ))
+            }))
             .await
             .context("failed to clean up unused files")?;
 
@@ -122,11 +123,14 @@ impl CleanGitCommand {
 
         let dry_run = self.is_dry_run();
 
-        try_join_all(
-            git_projects
-                .iter()
-                .map(|git_dir| remove_dead_branches(dry_run, git_dir)),
-        )
+        try_join_all(git_projects.iter().map(|git_dir| async move {
+            remove_dead_branches(dry_run, git_dir)
+                .await
+                .context(format!(
+                    "failed to clean up dead branches in {}",
+                    git_dir.display()
+                ))
+        }))
         .await
         .context("failed to clean up dead branches")?;
 
@@ -219,44 +223,40 @@ async fn run_git_fetch_all(git_dir: &Path) -> Result<()> {
 }
 
 async fn remove_dead_branches(dry_run: bool, git_dir: &Path) -> Result<()> {
-    wrap(async move {
-        let branches = Command::new("git")
-            .arg("for-each-ref")
-            .arg("--format")
-            .arg("%(refname:short) %(upstream:track)")
-            .current_dir(git_dir)
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .context("failed to get git refs")?;
+    let branches = Command::new("git")
+        .arg("for-each-ref")
+        .arg("--format")
+        .arg("%(refname:short) %(upstream:track)")
+        .current_dir(git_dir)
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("failed to get git refs")?;
 
-        let branches = String::from_utf8(branches.stdout)
-            .context("failed to parse output of git refs as utf9")?;
+    let branches =
+        String::from_utf8(branches.stdout).context("failed to parse output of git refs as utf9")?;
 
-        for line in branches.lines() {
-            let items = line.split_whitespace().collect::<Vec<_>>();
-            if items.len() == 2 && items[1] == "[gone]" {
-                let branch = items[0];
+    for line in branches.lines() {
+        let items = line.split_whitespace().collect::<Vec<_>>();
+        if items.len() == 2 && items[1] == "[gone]" {
+            let branch = items[0];
 
-                if dry_run {
-                    println!("git branch -D {} # dry-run: {}", branch, git_dir.display());
-                } else {
-                    let _status = Command::new("git")
-                        .arg("branch")
-                        .arg("-D")
-                        .arg(branch)
-                        .current_dir(git_dir)
-                        .kill_on_drop(true)
-                        .status()
-                        .await
-                        .with_context(|| format!("failed to delete branch {}", branch,))?;
-                }
+            if dry_run {
+                println!("git branch -D {} # dry-run: {}", branch, git_dir.display());
+            } else {
+                let _status = Command::new("git")
+                    .arg("branch")
+                    .arg("-D")
+                    .arg(branch)
+                    .current_dir(git_dir)
+                    .kill_on_drop(true)
+                    .status()
+                    .await
+                    .with_context(|| format!("failed to delete branch {}", branch,))?;
             }
         }
+    }
 
-        Ok(())
-    })
-    .await
-    .with_context(|| format!("failed to clean up dead branches in {}", git_dir.display()))
+    Ok(())
 }
