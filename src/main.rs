@@ -9,6 +9,7 @@ mod clean;
 mod cli;
 mod crate_deps;
 mod git;
+mod trace_parser;
 
 #[tokio::main]
 

@@ -23,9 +23,15 @@ tokio = { version = "1.22.0", features = [
     "process",
     "fs",
     "sync",
+    "io-util",
 ] }
 tracing-subscriber = { version = "0.3.17", features = ["fmt"] }
 log = "0.4.29"
+
+[dev-dependencies]
+assert_fs = "1.0"
+assert_cmd = "2.0"
+fs-err = "2.11"
 
 [profile.release]
 lto = "off"
