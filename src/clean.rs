@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use cargo_metadata::{CargoOpt, MetadataCommand};
 use clap::ArgAction;
 use clap::{Args, ValueHint};
+use dialoguer::{theme::ColorfulTheme, MultiSelect};
 use futures::{future::try_join_all, try_join};
 use tokio::fs;
 
@@ -201,33 +202,11 @@ impl CleanCommand {
             features: self.features.clone(),
         };
 
-        let feature_desc = if feature_config.all_features {
-            "all features".to_string()
-        } else if let Some(ref f) = feature_config.features {
-            format!("features: {}", f)
-        } else if feature_config.no_default_features {
-            "no default features".to_string()
-        } else {
-            "auto-detected features".to_string()
-        };
-
-        log::info!(
-            "Using trace mode: {:?} for profiles: {:?} with {}",
-            mode,
-            profiles,
-            feature_desc
-        );
-
         let parser = TraceParser::new(target_dir.to_path_buf());
         let trace_result = parser
             .trace_profiles(project_dir, mode, &profiles, &feature_config)
             .await
             .context("Failed to trace cargo build")?;
-
-        log::info!(
-            "Trace found {} used artifacts",
-            trace_result.used_artifacts.len()
-        );
 
         // Now scan target directory and find artifacts not in the trace
         let mut stats = CleanupStats::default();
@@ -488,6 +467,49 @@ impl CleanCommand {
                 });
 
         Ok(total_stats)
+    }
+
+    /// Detect available profiles in the target directory
+    async fn detect_profiles(target_dir: &Path) -> Result<Vec<String>> {
+        let mut profiles = Vec::new();
+        
+        let mut entries = fs::read_dir(target_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    // Check if it has a deps subdirectory (indicating it's a profile)
+                    let deps_dir = path.join("deps");
+                    if deps_dir.exists() && !name.starts_with('.') {
+                        profiles.push(name.to_string());
+                    }
+                }
+            }
+        }
+        
+        profiles.sort();
+        Ok(profiles)
+    }
+
+    /// Show interactive profile selector if no profiles specified
+    fn select_profiles_interactive(available: Vec<String>) -> Result<Vec<String>> {
+        if available.is_empty() {
+            anyhow::bail!("No profiles found in target directory");
+        }
+
+        println!("\n📊 Available profiles in target/:");
+        
+        let selections = MultiSelect::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select profiles to clean (Space to select, Enter to confirm)")
+            .items(&available)
+            .defaults(&vec![true; available.len()]) // All selected by default
+            .interact()?;
+
+        if selections.is_empty() {
+            anyhow::bail!("No profiles selected");
+        }
+
+        Ok(selections.into_iter().map(|i| available[i].clone()).collect())
     }
 
     pub async fn run(self) -> Result<()> {

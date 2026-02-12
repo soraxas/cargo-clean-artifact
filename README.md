@@ -1,80 +1,48 @@
-# ddt
+# cargo-clean-artifact
 
-Dudy dev tools.
+Clean old cargo build artifacts and dependencies that are no longer used by any workspace features.
 
-# Installation
+## Installation
 
 ```sh
-cargo install ddt
+cargo install cargo-clean-artifact
 ```
 
-## `ddt git`
+## Usage
 
-### `ddt git resolve-lockfile-conflict`
-
-This command allows you to resolve conflicts in lockfiles automatically.
-
-#### Usage
-
-Credit: https://github.com/Praqma/git-merge-driver#documentation
-
-Add a custom merge driver to your **global** gitconfig file. (Typically `~/.gitconfig`)
-
-```gitconfig
-[merge "ddt-lockfile"]
-	name = A custom merge driver used to resolve conflicts in lockfiles automatically
-	driver = ddt git resolve-lockfile-conflict  %O %A %B %L %P
-
+```sh
+cargo clean-artifact [OPTIONS]
 ```
 
-then, add some entries to the `.gitattributes` of your project.
-You can specify this multiple times.
-
-If your project uses `pnpm` and `cargo` for managing dependencies, you can add this to `.gitattributes`:
-
-```gitattributes
- pnpm.yaml merge=ddt-lockfile
- Cargo.lock merge=ddt-lockfile
-```
-
-## `ddt clean`
-
-### Features
-
-- Clean dead git branches.
-- Remove **outdated** cargo artifacts using three different modes.
-
----
-
-Usage: `ddt clean path/to/dir [OPTIONS]`
-
-#### Cleaning Modes
+### Cleaning Modes
 
 **1. Default Mode (Fast, ~50-60% accurate)**
 ```bash
-ddt clean .
+cargo clean-artifact
 ```
 Uses `.d` dependency files to detect unused artifacts. Fastest but may miss some stray files.
 
 **2. Check Mode (Recommended, ~80-90% accurate)**
 ```bash
-ddt clean --check-mode .
+cargo clean-artifact --check-mode
 ```
 Runs `cargo check` with trace logging to see which artifacts are actually used.
 - Faster than build mode (~10-20 seconds)
 - More accurate than default mode
 - May miss some `.rlib` files that are only needed during full builds
 - By default uses current feature configuration (auto-detected)
+- **Shows cargo compilation progress in real-time**
 
 **3. Build Mode (Most thorough, ~95-99% accurate)**
 ```bash
-ddt clean --build-mode .
+cargo clean-artifact --build-mode
 ```
 Runs `cargo build` with trace logging for maximum accuracy.
 - Takes longer (~30-60 seconds)
 - Most complete detection of unused artifacts
 - Recommended for thorough cleanup
 - By default uses current feature configuration (auto-detected)
+- **Shows cargo compilation progress in real-time**
 
 #### Additional Options
 
@@ -125,8 +93,15 @@ Both trace modes properly handle:
 
 **Feature detection**: By default, the tool uses your project's current feature configuration (auto-detected). Use `--all-features` for thorough checking of all dependencies, or `--features` to specify exactly which features to trace.
 
-#### Dead Git Branches
+## Features
 
-- dead git branches if you pass `--remove-dead-git-branches`
+- **Trace-based cleaning**: Most accurate artifact detection using cargo's own build trace
+- **Real-time progress**: See what's being compiled during trace mode
+- **Interactive profile selection**: Automatically detect and let you choose which profiles to clean
+- **Feature-aware**: Supports `--all-features`, `--no-default-features`, and `--features`
+- **Safe**: Uses `.rlib`/`.rmeta` pairing to prevent false positives and unnecessary recompilation
+- **Beautiful output**: Shows top 10 largest files, per-profile breakdowns, and clear summaries
 
-The dead branch is determined by running `git fetch --all`, and branches are removed if upstream tracking branch is gone.
+## License
+
+MIT

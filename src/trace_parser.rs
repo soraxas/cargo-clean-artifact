@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -69,14 +70,13 @@ impl TraceParser {
         } else if feature_config.no_default_features {
             " with no default features".to_string()
         } else {
-            " (auto-detected features)".to_string()
+            "".to_string()
         };
 
-        log::info!(
-            "Running cargo {:?}{} with trace logging in {}",
+        println!(
+            "🔍 Tracing dependencies using cargo {:?}{}...",
             mode,
-            feature_desc,
-            project_dir.display()
+            feature_desc
         );
 
         let mut cmd = Command::new("cargo");
@@ -115,16 +115,15 @@ impl TraceParser {
         // Set trace logging
         cmd.env("CARGO_LOG", "cargo::core::compiler::fingerprint=trace");
 
-        // Capture stderr where trace logs go
+        // Capture both stdout and stderr
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-
-        log::debug!("Executing: cargo {:?}", cmd.as_std().get_args());
 
         let mut child = cmd
             .spawn()
             .context("Failed to spawn cargo command")?;
 
+        let stdout = child.stdout.take().context("Failed to capture stdout")?;
         let stderr = child
             .stderr
             .take()
@@ -132,11 +131,41 @@ impl TraceParser {
 
         let mut result = TraceResult::default();
 
-        // Parse stderr in real-time
-        let mut reader = BufReader::new(stderr).lines();
-        while let Some(line) = reader.next_line().await? {
-            if let Some(path) = self.extract_artifact_path(&line) {
-                result.used_artifacts.insert(path);
+        // Get readers for both stdout and stderr
+        let mut stdout_reader = BufReader::new(stdout).lines();
+        let mut stderr_reader = BufReader::new(stderr).lines();
+        
+        println!(); // Add a blank line before cargo output
+        
+        // Read both streams concurrently
+        loop {
+            tokio::select! {
+                // Pass through stdout (cargo's compilation progress)
+                stdout_line = stdout_reader.next_line() => {
+                    match stdout_line? {
+                        Some(line) => {
+                            // Show cargo's progress output directly
+                            println!("{}", line);
+                        }
+                        None => {
+                            // stdout closed
+                        }
+                    }
+                }
+                // Parse stderr for trace logs
+                stderr_line = stderr_reader.next_line() => {
+                    match stderr_line? {
+                        Some(line) => {
+                            if let Some(path) = self.extract_artifact_path(&line) {
+                                result.used_artifacts.insert(path);
+                            }
+                        }
+                        None => {
+                            // stderr closed, we're done
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -146,10 +175,7 @@ impl TraceParser {
             anyhow::bail!("Cargo command failed with status: {}", status);
         }
 
-        log::info!(
-            "Trace complete: found {} used artifacts",
-            result.used_artifacts.len()
-        );
+        println!("\n✅ Trace complete: found {} artifacts in use\n", result.used_artifacts.len());
 
         Ok(result)
     }
@@ -204,8 +230,11 @@ impl TraceParser {
     ) -> Result<TraceResult> {
         let mut merged = TraceResult::default();
 
-        for profile in profiles {
-            log::info!("Tracing profile: {}", profile);
+        for (idx, profile) in profiles.iter().enumerate() {
+            if profiles.len() > 1 {
+                println!("📦 Profile {}/{}: {}", idx + 1, profiles.len(), profile);
+            }
+            
             let result = self
                 .trace(project_dir, mode, Some(profile), feature_config)
                 .await

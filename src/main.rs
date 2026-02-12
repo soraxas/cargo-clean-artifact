@@ -1,35 +1,20 @@
 use anyhow::Result;
 use clap::Parser;
-use log::info;
 
 use crate::cli::CliArgs;
 
-mod analyse;
 mod clean;
 mod cli;
 mod crate_deps;
-mod git;
 mod trace_parser;
 
 #[tokio::main]
-
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_timer(tracing_subscriber::fmt::time::uptime())
-        .with_level(true)
-        .pretty()
-        .init();
+    // Simple env_logger for debugging (only shows on RUST_LOG=debug)
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let args = CliArgs::parse();
-
-    let start = std::time::Instant::now();
-
-    info!("Start");
-
     args.run().await?;
-
-    info!("End in {:?}", start.elapsed());
 
     Ok(())
 }

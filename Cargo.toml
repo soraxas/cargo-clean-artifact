@@ -13,8 +13,12 @@ anyhow = { version = "1.0.86", default-features = false }
 # lightweight ANSI styling
 anstyle = { version = "1.0.0", default-features = false }
 cargo_metadata = { version = "0.15.2", default-features = false }
-clap = { version = "4.0.29", features = ["derive"] }
+clap = { version = "4.0.29", features = ["derive", "color"] }
+dialoguer = "0.11"
+env_logger = "0.11"
 futures = "0.3.25"
+indicatif = "0.17"
+log = "0.4.29"
 semver = { version = "1.0.27", default-features = false }
 tokio = { version = "1.22.0", features = [
     "rt",
@@ -25,8 +29,6 @@ tokio = { version = "1.22.0", features = [
     "sync",
     "io-util",
 ] }
-tracing-subscriber = { version = "0.3.17", features = ["fmt"] }
-log = "0.4.29"
 
 [dev-dependencies]
 assert_fs = "1.0"
