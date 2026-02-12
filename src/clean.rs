@@ -53,6 +53,11 @@ pub(crate) struct CleanCommand {
     #[clap(long = "build-mode", conflicts_with = "check_mode")]
     build_mode: bool,
 
+    /// Custom build command to trace (e.g. "cargo build --release --target x86_64-unknown-linux-gnu").
+    /// If specified, this overrides --check-mode and --build-mode.
+    #[clap(long = "command", value_name = "COMMAND", conflicts_with_all = &["check_mode", "build_mode"])]
+    custom_command: Option<String>,
+
     /// Profiles to check (default: debug). Can be specified multiple times.
     #[clap(long = "profile", value_name = "PROFILE")]
     profiles: Vec<String>,
@@ -119,6 +124,24 @@ impl CleanupStats {
 }
 
 impl CleanCommand {
+    /// Detect the profile from a custom cargo command
+    fn detect_profile_from_command(command: &str) -> String {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        
+        // Look for --profile <name> or --release
+        for i in 0..parts.len() {
+            if parts[i] == "--release" {
+                return "release".to_string();
+            }
+            if parts[i] == "--profile" && i + 1 < parts.len() {
+                return parts[i + 1].to_string();
+            }
+        }
+        
+        // Default to debug
+        "debug".to_string()
+    }
+    
     /// Clean up `target` of cargo.
     ///
     /// We only remove build outputs for outdated dependencies.
@@ -138,10 +161,25 @@ impl CleanCommand {
         };
 
         let target_dir = metadata.target_directory.as_std_path().to_path_buf();
+        
+        // Get project name and available features for feature detection
+        let project_name = metadata.workspace_root
+            .as_std_path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        
+        // Get list of available features from the root package
+        let available_features: Vec<String> = metadata
+            .packages
+            .iter()
+            .find(|pkg| pkg.name == project_name)
+            .map(|pkg| pkg.features.keys().cloned().collect())
+            .unwrap_or_default();
 
         // Use trace mode if requested
-        if self.check_mode || self.build_mode {
-            return self.remove_unused_files_with_trace(git_dir, &target_dir).await;
+        if self.check_mode || self.build_mode || self.custom_command.is_some() {
+            return self.remove_unused_files_with_trace(git_dir, &target_dir, project_name, &available_features).await;
         }
 
         // Otherwise use the legacy .d file method
@@ -182,6 +220,8 @@ impl CleanCommand {
         &self,
         project_dir: &Path,
         target_dir: &Path,
+        project_name: &str,
+        available_features: &[String],
     ) -> Result<CleanupStats> {
         let mode = if self.check_mode {
             TraceMode::Check
@@ -189,22 +229,43 @@ impl CleanCommand {
             TraceMode::Build
         };
 
-        let profiles = if self.profiles.is_empty() {
+        // Detect profiles from custom command or use specified profiles
+        let profiles = if let Some(ref cmd) = self.custom_command {
+            // Parse profile from custom command
+            vec![Self::detect_profile_from_command(cmd)]
+        } else if self.profiles.is_empty() {
             vec!["debug".to_string()]
         } else {
             self.profiles.clone()
         };
 
-        // Build feature configuration
-        let feature_config = crate::trace_parser::FeatureConfig {
-            all_features: self.all_features,
-            no_default_features: self.no_default_features,
-            features: self.features.clone(),
+        // Build feature configuration - auto-detect if no flags specified and no custom command
+        let feature_config = if self.custom_command.is_some() {
+            // Custom command - don't add feature flags automatically
+            crate::trace_parser::FeatureConfig::default()
+        } else if self.all_features || self.no_default_features || self.features.is_some() {
+            // User explicitly specified features
+            crate::trace_parser::FeatureConfig {
+                all_features: self.all_features,
+                no_default_features: self.no_default_features,
+                features: self.features.clone(),
+            }
+        } else {
+            // Auto-detect from fingerprints, validating against available features
+            let profile_name = if profiles[0] == "dev" { "debug" } else { &profiles[0] };
+            crate::trace_parser::FeatureConfig::auto_detect_from_fingerprints(
+                target_dir,
+                profile_name,
+                project_name,
+                available_features,
+            )
+            .await
+            .unwrap_or_default()
         };
 
         let parser = TraceParser::new(target_dir.to_path_buf());
         let trace_result = parser
-            .trace_profiles(project_dir, mode, &profiles, &feature_config)
+            .trace_profiles(project_dir, mode, &profiles, &feature_config, self.custom_command.as_deref())
             .await
             .context("Failed to trace cargo build")?;
 
@@ -593,7 +654,7 @@ impl CleanCommand {
         print_detailed_summary(&total_stats);
 
         // Interactive confirmation if using trace mode and not in --yes mode
-        let should_remove = if (self.check_mode || self.build_mode) && !self.yes {
+        let should_remove = if (self.check_mode || self.build_mode || self.custom_command.is_some()) && !self.yes {
             prompt_confirmation(&total_stats)?
         } else {
             !self.dry_run || self.yes
