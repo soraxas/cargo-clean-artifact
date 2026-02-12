@@ -15,7 +15,7 @@ pub(crate) async fn read_deps_dir(dir: &Path) -> Result<Vec<DepFile>> {
 
     while let Some(e) = entries.next_entry().await? {
         let path = e.path();
-        if path.extension().map_or(false, |ext| ext == "d") {
+        if path.extension().is_some_and(|ext| ext == "d") {
             let content = fs::read_to_string(&path).await?;
             let file = parse_dep_file(&content)?;
             files.push(file);
@@ -75,6 +75,6 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
     } else if b >= KB {
         format!("{:.2} KiB", b / KB)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }

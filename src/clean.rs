@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use cargo_metadata::{CargoOpt, MetadataCommand};
 use clap::ArgAction;
 use clap::{Args, ValueHint};
-use dialoguer::{theme::ColorfulTheme, MultiSelect};
+use dialoguer::{MultiSelect, theme::ColorfulTheme};
 use futures::{future::try_join_all, try_join};
 use tokio::fs;
 
@@ -127,7 +127,7 @@ impl CleanCommand {
     /// Detect the profile from a custom cargo command
     fn detect_profile_from_command(command: &str) -> String {
         let parts: Vec<&str> = command.split_whitespace().collect();
-        
+
         // Look for --profile <name> or --release
         for i in 0..parts.len() {
             if parts[i] == "--release" {
@@ -137,11 +137,11 @@ impl CleanCommand {
                 return parts[i + 1].to_string();
             }
         }
-        
+
         // Default to debug
         "debug".to_string()
     }
-    
+
     /// Clean up `target` of cargo.
     ///
     /// We only remove build outputs for outdated dependencies.
@@ -161,14 +161,15 @@ impl CleanCommand {
         };
 
         let target_dir = metadata.target_directory.as_std_path().to_path_buf();
-        
+
         // Get project name and available features for feature detection
-        let project_name = metadata.workspace_root
+        let project_name = metadata
+            .workspace_root
             .as_std_path()
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
-        
+
         // Get list of available features from the root package
         let available_features: Vec<String> = metadata
             .packages
@@ -179,7 +180,14 @@ impl CleanCommand {
 
         // Use trace mode if requested
         if self.check_mode || self.build_mode || self.custom_command.is_some() {
-            return self.remove_unused_files_with_trace(git_dir, &target_dir, project_name, &available_features).await;
+            return self
+                .remove_unused_files_with_trace(
+                    git_dir,
+                    &target_dir,
+                    project_name,
+                    &available_features,
+                )
+                .await;
         }
 
         // Otherwise use the legacy .d file method
@@ -252,7 +260,11 @@ impl CleanCommand {
             }
         } else {
             // Auto-detect from fingerprints, validating against available features
-            let profile_name = if profiles[0] == "dev" { "debug" } else { &profiles[0] };
+            let profile_name = if profiles[0] == "dev" {
+                "debug"
+            } else {
+                &profiles[0]
+            };
             crate::trace_parser::FeatureConfig::auto_detect_from_fingerprints(
                 target_dir,
                 profile_name,
@@ -265,7 +277,13 @@ impl CleanCommand {
 
         let parser = TraceParser::new(target_dir.to_path_buf());
         let trace_result = parser
-            .trace_profiles(project_dir, mode, &profiles, &feature_config, self.custom_command.as_deref())
+            .trace_profiles(
+                project_dir,
+                mode,
+                &profiles,
+                &feature_config,
+                self.custom_command.as_deref(),
+            )
             .await
             .context("Failed to trace cargo build")?;
 
@@ -283,7 +301,7 @@ impl CleanCommand {
             let profile_stats = self
                 .clean_with_trace_result(&deps_dir, &trace_result.used_artifacts, profile_name)
                 .await
-                .context(format!("Failed to clean profile: {}", profile_name))?;
+                .context(format!("Failed to clean profile: {profile_name}"))?;
 
             stats.merge_from(profile_stats);
         }
@@ -350,12 +368,7 @@ impl CleanCommand {
                 profile: profile.to_string(),
             });
 
-            fn update_stats(
-                stats: &mut CleanupStats,
-                crate_key: &str,
-                size: u64,
-                profile: &str,
-            ) {
+            fn update_stats(stats: &mut CleanupStats, crate_key: &str, size: u64, profile: &str) {
                 stats.files += 1;
                 stats.bytes += size;
                 let entry = stats.per_crate.entry(crate_key.to_string()).or_default();
@@ -518,14 +531,13 @@ impl CleanCommand {
         .await
         .context("failed to process dep files")?;
 
-        let total_stats =
-            stats
-                .drain(..)
-                .filter_map(|s| s)
-                .fold(CleanupStats::default(), |mut acc, s| {
-                    acc.merge_from(s);
-                    acc
-                });
+        let total_stats = stats
+            .drain(..)
+            .flatten()
+            .fold(CleanupStats::default(), |mut acc, s| {
+                acc.merge_from(s);
+                acc
+            });
 
         Ok(total_stats)
     }
@@ -533,7 +545,7 @@ impl CleanCommand {
     /// Detect available profiles in the target directory
     async fn detect_profiles(target_dir: &Path) -> Result<Vec<String>> {
         let mut profiles = Vec::new();
-        
+
         let mut entries = fs::read_dir(target_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
@@ -547,7 +559,7 @@ impl CleanCommand {
                 }
             }
         }
-        
+
         profiles.sort();
         Ok(profiles)
     }
@@ -559,7 +571,7 @@ impl CleanCommand {
         }
 
         println!("\n📊 Available profiles in target/:");
-        
+
         let selections = MultiSelect::with_theme(&ColorfulTheme::default())
             .with_prompt("Select profiles to clean (Space to select, Enter to confirm)")
             .items(&available)
@@ -570,7 +582,10 @@ impl CleanCommand {
             anyhow::bail!("No profiles selected");
         }
 
-        Ok(selections.into_iter().map(|i| available[i].clone()).collect())
+        Ok(selections
+            .into_iter()
+            .map(|i| available[i].clone())
+            .collect())
     }
 
     pub async fn run(self) -> Result<()> {
@@ -586,7 +601,7 @@ impl CleanCommand {
                 paint(color, "Warning:", warn_style),
                 paint(
                     color,
-                    format!("CARGO_TARGET_DIR is set to {}", target_dir),
+                    format!("CARGO_TARGET_DIR is set to {target_dir}"),
                     accent_style
                 )
             );
@@ -620,11 +635,11 @@ impl CleanCommand {
         }
 
         // todo: recursively find all git projects in the directory
-        let dirs = vec![self.dir.clone()];
+        let dirs = [self.dir.clone()];
 
         let remove_unused_files = async {
             let stats = try_join_all(dirs.iter().map(async |dir| {
-                self.remove_unused_files_of_cargo(&dir.as_path())
+                self.remove_unused_files_of_cargo(dir.as_path())
                     .await
                     .with_context(|| {
                         format!("failed to clean up unused files in {}", dir.display())
@@ -654,11 +669,12 @@ impl CleanCommand {
         print_detailed_summary(&total_stats);
 
         // Interactive confirmation if using trace mode and not in --yes mode
-        let should_remove = if (self.check_mode || self.build_mode || self.custom_command.is_some()) && !self.yes {
-            prompt_confirmation(&total_stats)?
-        } else {
-            !self.dry_run || self.yes
-        };
+        let should_remove =
+            if (self.check_mode || self.build_mode || self.custom_command.is_some()) && !self.yes {
+                prompt_confirmation(&total_stats)?
+            } else {
+                !self.dry_run || self.yes
+            };
 
         if should_remove {
             let removal_stats = self.actually_remove_files(&total_stats).await?;
@@ -721,7 +737,7 @@ fn print_detailed_summary(stats: &CleanupStats) {
         for (profile, profile_stat) in &stats.per_profile {
             println!(
                 "  {} {} files ({})",
-                paint(color, format!("{}:", profile), profile_style),
+                paint(color, format!("{profile}:"), profile_style),
                 profile_stat.files,
                 format_bytes(profile_stat.bytes)
             );
@@ -804,7 +820,7 @@ fn print_top_crates(stats: &CleanupStats, color: bool) {
     for (name, stat) in crates.iter().take(MAX_CRATES) {
         println!(
             "  - {}: {} files ({})",
-            paint(color, name.to_string(), accent_style),
+            paint(color, name, accent_style),
             paint(color, stat.files.to_string(), accent_style),
             paint(color, format_bytes(stat.bytes), accent_style)
         );
@@ -813,11 +829,7 @@ fn print_top_crates(stats: &CleanupStats, color: bool) {
     if crates.len() > MAX_CRATES {
         println!(
             "  ... and {} more crates",
-            paint(
-                color,
-                (crates.len() - MAX_CRATES).to_string(),
-                accent_style
-            )
+            paint(color, (crates.len() - MAX_CRATES).to_string(), accent_style)
         );
     }
 }
@@ -848,9 +860,8 @@ fn print_errors(stats: &CleanupStats, color: bool) {
             paint(color, crate_name, error_crate_style),
             paint(color, flavor, error_flavor_style),
             paint(color, file, error_file_style),
-            paint(color, format!("{}", error), error_headline_style),
+            paint(color, format!("{error}"), error_headline_style),
         );
     }
     println!();
 }
-

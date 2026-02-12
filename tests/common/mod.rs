@@ -23,7 +23,7 @@ pub fn cargo_cmd(dir: impl AsRef<Path>) -> Command {
 
 pub struct TestContext {
     temp_dir: ChildPath,
-    
+
     // To keep the directory alive
     #[allow(dead_code)]
     _root: assert_fs::TempDir,
@@ -33,7 +33,7 @@ impl TestContext {
     pub fn new() -> Self {
         let root = assert_fs::TempDir::new().expect("Failed to create test root directory");
         let temp_dir = root.child("project");
-        
+
         fs_err::create_dir_all(&temp_dir).expect("Failed to create test working directory");
 
         Self {
@@ -62,7 +62,7 @@ impl TestContext {
             .arg("none")
             .output()
             .expect("Failed to init cargo project");
-            
+
         // Also init git separately
         self.git_init();
     }

@@ -39,38 +39,40 @@ impl FeatureConfig {
         use tokio::fs;
 
         let fingerprint_dir = target_dir.join(profile).join(".fingerprint");
-        
+
         if !fingerprint_dir.exists() {
             log::debug!("No fingerprint directory found, using defaults");
             return Ok(Self::default());
         }
 
         let mut detected_features: HashSet<String> = HashSet::new();
-        
+
         // Normalize project name (replace - with _)
         let normalized_project_name = project_name.replace('-', "_");
-        
+
         // Read all fingerprint files
         let mut entries = fs::read_dir(&fingerprint_dir).await?;
-        
+
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
-            
+
             // Only look at fingerprints for the project itself
             let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !dir_name.starts_with(&normalized_project_name) && !dir_name.starts_with(project_name) {
+            if !dir_name.starts_with(&normalized_project_name)
+                && !dir_name.starts_with(project_name)
+            {
                 continue;
             }
-            
+
             // Look for JSON files in the project's fingerprint directory
             let mut json_entries = fs::read_dir(&path).await?;
-            
+
             while let Some(json_entry) = json_entries.next_entry().await? {
                 let json_path = json_entry.path();
-                
+
                 if json_path.extension().and_then(|s| s.to_str()) == Some("json") {
                     // Try to parse the JSON
                     if let Ok(content) = fs::read_to_string(&json_path).await {
@@ -78,11 +80,13 @@ impl FeatureConfig {
                         for line in content.lines() {
                             if let Ok(json) = serde_json::from_str::<Value>(line) {
                                 // Extract features array
-                                if let Some(features_str) = json.get("features")
-                                    .and_then(|v| v.as_str()) 
+                                if let Some(features_str) =
+                                    json.get("features").and_then(|v| v.as_str())
                                 {
                                     // Parse the features string which looks like: "[\"default\", \"rayon\"]"
-                                    if let Ok(features_array) = serde_json::from_str::<Vec<String>>(features_str) {
+                                    if let Ok(features_array) =
+                                        serde_json::from_str::<Vec<String>>(features_str)
+                                    {
                                         detected_features.extend(features_array);
                                     }
                                 }
@@ -92,52 +96,55 @@ impl FeatureConfig {
                 }
             }
         }
-        
+
         if detected_features.is_empty() {
-            log::debug!("No features found in fingerprints for {}, using defaults", project_name);
+            log::debug!("No features found in fingerprints for {project_name}, using defaults");
             return Ok(Self::default());
         }
-        
+
         // Remove "default" from the list as it's implicit
         detected_features.remove("default");
-        
+
         if detected_features.is_empty() {
             // Only "default" feature was used
             return Ok(Self::default());
         }
-        
+
         // Create a set of available features for fast lookup
         let available_set: HashSet<String> = available_features.iter().cloned().collect();
-        
+
         // Filter detected features to only include ones that currently exist
         let valid_features: Vec<String> = detected_features
             .iter()
             .filter(|f| available_set.contains(*f))
             .cloned()
             .collect();
-        
+
         let invalid_features: Vec<String> = detected_features
             .iter()
             .filter(|f| !available_set.contains(*f))
             .cloned()
             .collect();
-        
+
         // Show warning if some features are no longer available
         if !invalid_features.is_empty() {
             let mut sorted_invalid = invalid_features;
             sorted_invalid.sort();
-            println!("⚠️  Ignoring outdated features: {}", sorted_invalid.join(", "));
+            println!(
+                "⚠️  Ignoring outdated features: {}",
+                sorted_invalid.join(", ")
+            );
         }
-        
+
         if valid_features.is_empty() {
             // All detected features are outdated, use defaults
             Ok(Self::default())
         } else {
             let mut sorted_features = valid_features;
             sorted_features.sort();
-            
+
             println!("🔎 Auto-detected features: {}", sorted_features.join(", "));
-            
+
             Ok(Self {
                 all_features: false,
                 no_default_features: false,
@@ -145,7 +152,7 @@ impl FeatureConfig {
             })
         }
     }
-    
+
     pub fn is_default(&self) -> bool {
         !self.all_features && !self.no_default_features && self.features.is_none()
     }
@@ -180,7 +187,7 @@ impl TraceParser {
         let feature_desc = if feature_config.all_features {
             " with all features".to_string()
         } else if let Some(ref features) = feature_config.features {
-            format!(" with features: {}", features)
+            format!(" with features: {features}")
         } else if feature_config.no_default_features {
             " with no default features".to_string()
         } else {
@@ -188,13 +195,9 @@ impl TraceParser {
         };
 
         if let Some(cmd_str) = custom_command {
-            println!("🔍 Tracing with custom command: {}...", cmd_str);
+            println!("🔍 Tracing with custom command: {cmd_str}...");
         } else {
-            println!(
-                "🔍 Tracing dependencies using cargo {:?}{}...",
-                mode,
-                feature_desc
-            );
+            println!("🔍 Tracing dependencies using cargo {mode:?}{feature_desc}...");
         }
 
         let mut cmd = if let Some(cmd_str) = custom_command {
@@ -203,7 +206,7 @@ impl TraceParser {
             if parts.is_empty() {
                 anyhow::bail!("Custom command is empty");
             }
-            
+
             let mut command = Command::new(parts[0]);
             if parts.len() > 1 {
                 command.args(&parts[1..]);
@@ -212,7 +215,7 @@ impl TraceParser {
         } else {
             // Build standard cargo command
             let mut command = Command::new("cargo");
-            
+
             // Set the command based on mode
             match mode {
                 TraceMode::Check => {
@@ -242,46 +245,52 @@ impl TraceParser {
                     command.arg("--release");
                 }
             }
-            
+
             command
         };
 
         cmd.current_dir(project_dir);
 
         // Set trace logging
-        cmd.env("CARGO_LOG", "cargo::core::compiler::fingerprint=trace");
+        cmd.env("CARGO_LOG", "cargo::core::compiler::fingerprint=trace")
+            .env("CARGO_TERM_COLOR", "always");
 
         // Capture both stdout and stderr
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let mut child = cmd
-            .spawn()
-            .context("Failed to spawn cargo command")?;
+        let mut child = cmd.spawn().context("Failed to spawn cargo command")?;
 
         let stdout = child.stdout.take().context("Failed to capture stdout")?;
-        let stderr = child
-            .stderr
-            .take()
-            .context("Failed to capture stderr")?;
+        let stderr = child.stderr.take().context("Failed to capture stderr")?;
 
         let mut result = TraceResult::default();
 
         // Get readers for both stdout and stderr
         let mut stdout_reader = BufReader::new(stdout).lines();
         let mut stderr_reader = BufReader::new(stderr).lines();
-        
-        println!(); // Add a blank line before cargo output
-        
+
+        // Create progress spinner
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::default_spinner()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+                .template("{spinner:.cyan} {msg}")
+                .unwrap(),
+        );
+        spinner.set_message("Tracing dependencies... (0 artifacts found)");
+        spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
         // Read both streams concurrently
+        let mut cur_status_line = None;
         loop {
             tokio::select! {
-                // Pass through stdout (cargo's compilation progress)
+                // Discard stdout (cargo's compilation progress)
                 stdout_line = stdout_reader.next_line() => {
                     match stdout_line? {
                         Some(line) => {
-                            // Show cargo's progress output directly
-                            println!("{}", line);
+                            // Silently consume stdout
+                            spinner.set_message(line);
                         }
                         None => {
                             // stdout closed
@@ -293,8 +302,17 @@ impl TraceParser {
                     match stderr_line? {
                         Some(line) => {
                             if let Some(path) = self.extract_artifact_path(&line) {
+                                // has artifact path
                                 result.used_artifacts.insert(path);
+                            } else if !line.contains("cargo::core::compiler::fingerprint:") && !line.trim().is_empty(){
+                                // this not a log line. store for display
+                                cur_status_line = Some(line);
                             }
+                            spinner.set_message(format!(
+                                "Tracing dependencies... ({} artifacts found)\n{}",
+                                result.used_artifacts.len(),
+                                &cur_status_line.as_ref().unwrap_or(&"".to_string())
+                            ));
                         }
                         None => {
                             // stderr closed, we're done
@@ -307,11 +325,16 @@ impl TraceParser {
 
         // Wait for command to complete
         let status = child.wait().await?;
-        if !status.success() {
-            anyhow::bail!("Cargo command failed with status: {}", status);
-        }
 
-        println!("\n✅ Trace complete: found {} artifacts in use\n", result.used_artifacts.len());
+        spinner.finish_with_message(format!(
+            "✅ Trace complete: found {} artifacts in use",
+            result.used_artifacts.len()
+        ));
+        println!(); // Blank line after spinner
+
+        if !status.success() {
+            anyhow::bail!("Cargo command failed with status: {status}");
+        }
 
         Ok(result)
     }
@@ -371,11 +394,17 @@ impl TraceParser {
             if profiles.len() > 1 && custom_command.is_none() {
                 println!("📦 Profile {}/{}: {}", idx + 1, profiles.len(), profile);
             }
-            
+
             let result = self
-                .trace(project_dir, mode, Some(profile), feature_config, custom_command)
+                .trace(
+                    project_dir,
+                    mode,
+                    Some(profile),
+                    feature_config,
+                    custom_command,
+                )
                 .await
-                .with_context(|| format!("Failed to trace profile: {}", profile))?;
+                .with_context(|| format!("Failed to trace profile: {profile}"))?;
 
             merged.used_artifacts.extend(result.used_artifacts);
         }
@@ -393,19 +422,25 @@ mod tests {
         let parser = TraceParser::new(PathBuf::from("/project/target"));
 
         // Test rlib extraction
-        let line = r#"max output mtime for "foo" is "/project/target/debug/deps/libfoo-abc123.rlib" 123s"#;
+        let line =
+            r#"max output mtime for "foo" is "/project/target/debug/deps/libfoo-abc123.rlib" 123s"#;
         let path = parser.extract_artifact_path(line);
         assert_eq!(
             path,
-            Some(PathBuf::from("/project/target/debug/deps/libfoo-abc123.rlib"))
+            Some(PathBuf::from(
+                "/project/target/debug/deps/libfoo-abc123.rlib"
+            ))
         );
 
         // Test rmeta extraction
-        let line = r#"max dep mtime for "bar" is "/project/target/debug/deps/libbar-xyz789.rmeta" 456s"#;
+        let line =
+            r#"max dep mtime for "bar" is "/project/target/debug/deps/libbar-xyz789.rmeta" 456s"#;
         let path = parser.extract_artifact_path(line);
         assert_eq!(
             path,
-            Some(PathBuf::from("/project/target/debug/deps/libbar-xyz789.rmeta"))
+            Some(PathBuf::from(
+                "/project/target/debug/deps/libbar-xyz789.rmeta"
+            ))
         );
 
         // Test non-matching line

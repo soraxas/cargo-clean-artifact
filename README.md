@@ -17,16 +17,21 @@ cargo clean-artifact [OPTIONS]
 ### Cleaning Modes
 
 **1. Default Mode (Fast, ~50-60% accurate)**
+
 ```bash
 cargo clean-artifact
 ```
+
 Uses `.d` dependency files to detect unused artifacts. Fastest but may miss some stray files.
 
 **2. Check Mode (Recommended, ~80-90% accurate)**
+
 ```bash
 cargo clean-artifact --check-mode
 ```
+
 Runs `cargo check` with trace logging to see which artifacts are actually used.
+
 - Faster than build mode (~10-20 seconds)
 - More accurate than default mode
 - May miss some `.rlib` files that are only needed during full builds
@@ -34,10 +39,13 @@ Runs `cargo check` with trace logging to see which artifacts are actually used.
 - **Shows cargo compilation progress in real-time**
 
 **3. Build Mode (Most thorough, ~95-99% accurate)**
+
 ```bash
 cargo clean-artifact --build-mode
 ```
+
 Runs `cargo build` with trace logging for maximum accuracy.
+
 - Takes longer (~30-60 seconds)
 - Most complete detection of unused artifacts
 - Recommended for thorough cleanup
@@ -90,10 +98,12 @@ If you run `ddt clean .` from a cargo project using git:
 **Default mode**: Uses `.d` dependency files. If an artifact for a specific version exists but it's not in the dependency graph anymore, it will be removed. Currently only removes large files like `.rlib` and `.rmeta`.
 
 **Trace modes** (recommended): Runs cargo with `CARGO_LOG=cargo::core::compiler::fingerprint=trace` to capture exactly which artifacts are referenced during the build process:
+
 - **Check mode**: Uses `cargo check` (~4s, fast, ~90% accurate)
 - **Build mode**: Uses `cargo build` (~30s, thorough, ~99% accurate)
 
 Both trace modes properly handle:
+
 - `.rlib` and `.rmeta` file pairing (keeps both if either is used to prevent recompilation)
 - Multiple build profiles (debug, release, custom)
 - Feature-specific dependencies via `--features`, `--all-features`, `--no-default-features`
@@ -102,13 +112,15 @@ Both trace modes properly handle:
 **Feature detection**: By default, the tool **auto-detects** which features were used in previous builds by parsing fingerprint files in `target/{profile}/.fingerprint/`. It then **validates** these against your current `Cargo.toml` to filter out any outdated features. This ensures the trace uses the same features you've been building with, making it faster and more accurate than `--all-features`.
 
 Example output:
-```
+
+```text
 🔎 Auto-detected features: rayon, p3p, kornia-pnp
 ⚠️  Ignoring outdated features: tracing-subscriber, old-feature
 🔍 Tracing dependencies using cargo Build with features: rayon,p3p,kornia-pnp...
 ```
 
 If you want to override auto-detection:
+
 - `--all-features`: Check all possible features (thorough but slower)
 - `--features "a,b,c"`: Check specific features only
 - `--no-default-features`: Check without default features
