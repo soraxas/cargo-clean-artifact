@@ -49,6 +49,27 @@ const SEP_C: &str = "\x1b[38;5;245m"; // mid-gray
 const SIZE_C: &str = "\x1b[32m"; // green
 const IDX_C: &str = "\x1b[2m"; // dim index
 
+// ── Profile palette (round-robin, stable per name) ───────────────────────────
+
+const PROFILE_PALETTE: &[&str] = &[
+    "\x1b[38;5;78m",  // medium sea green
+    "\x1b[38;5;75m",  // cornflower blue
+    "\x1b[38;5;141m", // medium orchid
+    "\x1b[38;5;215m", // peach/orange
+    "\x1b[38;5;156m", // light green
+    "\x1b[38;5;219m", // pink
+    "\x1b[38;5;159m", // light cyan
+    "\x1b[38;5;179m", // burlywood
+];
+
+/// Returns a stable ANSI color for a given profile string (round-robin by hash).
+pub fn profile_color(profile: &str) -> &'static str {
+    let idx = profile
+        .bytes()
+        .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
+    PROFILE_PALETTE[idx % PROFILE_PALETTE.len()]
+}
+
 // ── Theme ─────────────────────────────────────────────────────────────────────
 
 pub struct Theme {
@@ -56,16 +77,20 @@ pub struct Theme {
     pub profile: &'static str,
     /// ANSI code for the crate name (the sharp part after stripping `lib`)
     pub crate_name: &'static str,
+    /// Icon shown instead of the numeric index. `None` → show `N.` number.
+    pub line_icon: Option<&'static str>,
 }
 
 pub const IN_USE: Theme = Theme {
     profile: "\x1b[38;5;78m", // medium sea green
     crate_name: "\x1b[1;96m", // bold bright cyan
+    line_icon: None,
 };
 
 pub const TO_REMOVE: Theme = Theme {
-    profile: "\x1b[38;5;208m", // orange
-    crate_name: "\x1b[1;93m",  // bold bright yellow
+    profile: "\x1b[38;5;208m",            // orange
+    crate_name: "\x1b[1;93m",             // bold bright yellow
+    line_icon: Some("\x1b[31m🗑\x1b[0m "), // red trash icon
 };
 
 // ── Filename parser ───────────────────────────────────────────────────────────
@@ -162,8 +187,13 @@ pub fn format_artifact_line(
         })
         .unwrap_or_default();
 
+    let index_str = match theme.line_icon {
+        Some(icon) => format!("  {icon}"),
+        None => format!("  {IDX_C}{index:>3}.{RESET}"),
+    };
+
     format!(
-        "  {IDX_C}{index:>3}.{RESET} {}{profile}{RESET} {name} {SIZE_C}({size_str}){RESET}{used_by_str}",
+        "{index_str} {}{profile}{RESET} {name} {SIZE_C}({size_str}){RESET}{used_by_str}",
         theme.profile,
         size_str = format_bytes(size),
     )

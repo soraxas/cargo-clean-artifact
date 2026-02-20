@@ -617,8 +617,11 @@ impl CleanCommand {
 
         let total_stats = remove_unused_files.await?;
 
+        // Always show the per-profile size breakdown
+        print_profile_breakdown(&total_stats);
+
         if total_stats.files == 0 {
-            println!("\n✨ No unused artifacts found! Your target directory is already clean.");
+            println!("✨ No unused artifacts found! Your target directory is already clean.");
             return Ok(());
         }
 
@@ -664,10 +667,48 @@ fn prompt_confirmation(stats: &CleanupStats) -> Result<bool> {
     Ok(answer == "y" || answer == "yes")
 }
 
+fn print_profile_breakdown(stats: &CleanupStats) {
+    if stats.per_profile.is_empty() {
+        return;
+    }
+    let color = io::stdout().is_terminal();
+    let header_style = Style::new().fg_color(Some(AnsiColor::Cyan.into())).bold();
+
+    println!("{}", paint(color, "By profile:", header_style));
+    for (profile, profile_stat) in &stats.per_profile {
+        let total_suffix = if profile_stat.total_dir_bytes > 0 {
+            format!(
+                "  \x1b[2m[{} kept / {} total dir]\x1b[0m",
+                format_bytes(profile_stat.used_bytes),
+                format_bytes(profile_stat.total_dir_bytes),
+            )
+        } else {
+            String::new()
+        };
+        let to_remove = if profile_stat.files > 0 {
+            format!(
+                "  \x1b[31m-{} files ({})\x1b[0m",
+                profile_stat.files,
+                format_bytes(profile_stat.bytes)
+            )
+        } else {
+            String::new()
+        };
+        println!(
+            "  {}{}:\x1b[0m\x1b[0m{}{}",
+            crate::theme::profile_color(profile),
+            profile,
+            total_suffix,
+            to_remove,
+        );
+    }
+    println!();
+}
+
 fn print_detailed_summary(stats: &CleanupStats) {
     let color = io::stdout().is_terminal();
     let header_style = Style::new().fg_color(Some(AnsiColor::Cyan.into())).bold();
-    let profile_style = Style::new().fg_color(Some(AnsiColor::Magenta.into()));
+    let _profile_style = Style::new().fg_color(Some(AnsiColor::Magenta.into()));
     let size_style = Style::new().fg_color(Some(AnsiColor::Green.into()));
     let dim_style = Style::new().fg_color(Some(AnsiColor::BrightBlack.into()));
 
@@ -696,32 +737,13 @@ fn print_detailed_summary(stats: &CleanupStats) {
     );
     println!();
 
-    // Show per-profile breakdown
-    if !stats.per_profile.is_empty() {
-        println!("{}", paint(color, "By profile:", header_style));
-        for (profile, profile_stat) in &stats.per_profile {
-            let total_suffix = if profile_stat.total_dir_bytes > 0 {
-                format!(
-                    "  \x1b[2m[{} kept / {} total dir]\x1b[0m",
-                    format_bytes(profile_stat.used_bytes),
-                    format_bytes(profile_stat.total_dir_bytes),
-                )
-            } else {
-                String::new()
-            };
-            println!(
-                "  {} {} files ({}){}",
-                paint(color, format!("{profile}:"), profile_style),
-                profile_stat.files,
-                format_bytes(profile_stat.bytes),
-                total_suffix,
-            );
-        }
-        println!();
-    }
-
     // Show top 10 files to be removed
-    println!("{}", paint(color, "Top files to remove:", header_style));
+    if color {
+        // Red powerline-style header: red bg + bold white text + right-pointing arrow cap
+        println!("\x1b[41;1;97m 🗑  Files to remove: \x1b[0m\x1b[31m\u{e0b0}\x1b[0m");
+    } else {
+        println!("{}", paint(color, "Files to remove:", header_style));
+    }
     let mut files_sorted = stats.files_to_remove.clone();
     files_sorted.sort_by_key(|f| std::cmp::Reverse(f.size));
 
