@@ -207,13 +207,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_artifact_path() {
+    fn test_extract_artifact_and_target() {
         let parser = TraceParser::new(PathBuf::from("/project/target"));
 
         let line =
             r#"max output mtime for "foo" is "/project/target/debug/deps/libfoo-abc123.rlib" 123s"#;
         assert_eq!(
-            parser.extract_artifact_path(line),
+            parser.extract_artifact_and_target(line).map(|(p, _)| p),
             Some(PathBuf::from(
                 "/project/target/debug/deps/libfoo-abc123.rlib"
             ))
@@ -222,16 +222,16 @@ mod tests {
         let line =
             r#"max dep mtime for "bar" is "/project/target/debug/deps/libbar-xyz789.rmeta" 456s"#;
         assert_eq!(
-            parser.extract_artifact_path(line),
+            parser.extract_artifact_and_target(line).map(|(p, _)| p),
             Some(PathBuf::from(
                 "/project/target/debug/deps/libbar-xyz789.rmeta"
             ))
         );
 
         let line = "Some other log line without artifacts";
-        assert_eq!(parser.extract_artifact_path(line), None);
+        assert_eq!(parser.extract_artifact_and_target(line), None);
 
         let line = r#"max output mtime is "/other/path/libfoo-abc123.rlib" 123s"#;
-        assert_eq!(parser.extract_artifact_path(line), None);
+        assert_eq!(parser.extract_artifact_and_target(line), None);
     }
 }

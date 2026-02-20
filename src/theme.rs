@@ -203,3 +203,138 @@ pub fn format_artifact_line(
 pub fn format_more_line(remaining: usize, label: &str) -> String {
     format!("  {DIM}  … and {remaining} more {label}{RESET}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_artifact ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_artifact_rlib() {
+        let p = parse_artifact("libregex_automata-0b81c4f47542bec9.rlib");
+        assert!(p.lib_prefix);
+        assert_eq!(p.crate_name, "regex_automata");
+        assert_eq!(p.hash, Some("0b81c4f47542bec9"));
+        assert_eq!(p.ext, Some("rlib"));
+    }
+
+    #[test]
+    fn parse_artifact_rmeta() {
+        let p = parse_artifact("libserde-abc123.rmeta");
+        assert!(p.lib_prefix);
+        assert_eq!(p.crate_name, "serde");
+        assert_eq!(p.hash, Some("abc123"));
+        assert_eq!(p.ext, Some("rmeta"));
+    }
+
+    #[test]
+    fn parse_artifact_so_no_lib() {
+        let p = parse_artifact("libserde_derive-abc.so");
+        assert!(p.lib_prefix);
+        assert_eq!(p.crate_name, "serde_derive");
+    }
+
+    #[test]
+    fn parse_artifact_no_hash() {
+        let p = parse_artifact("libserde.rlib");
+        assert!(p.lib_prefix);
+        assert_eq!(p.crate_name, "serde");
+        assert_eq!(p.hash, None);
+        assert_eq!(p.ext, Some("rlib"));
+    }
+
+    #[test]
+    fn parse_artifact_no_lib_prefix() {
+        let p = parse_artifact("cargo_clean-abc.d");
+        assert!(!p.lib_prefix);
+        assert_eq!(p.crate_name, "cargo_clean");
+        assert_eq!(p.hash, Some("abc"));
+    }
+
+    #[test]
+    fn parse_artifact_multi_ext() {
+        // e.g. foo-HASH.foo.cgu.00.rcgu.dwo
+        let p = parse_artifact("foo-HASH.foo.cgu.00.rcgu.dwo");
+        assert!(!p.lib_prefix);
+        assert_eq!(p.crate_name, "foo");
+        assert_eq!(p.hash, Some("HASH"));
+        assert_eq!(p.ext, Some("foo.cgu.00.rcgu.dwo"));
+    }
+
+    // ── profile_color ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn profile_color_is_stable() {
+        // Same name always maps to the same color
+        assert_eq!(profile_color("debug"), profile_color("debug"));
+        assert_eq!(profile_color("release"), profile_color("release"));
+    }
+
+    #[test]
+    fn profile_color_different_profiles_can_differ() {
+        // "debug" and "release" should hash to different palette slots
+        // (This checks the round-robin logic is non-trivial)
+        let colors: Vec<&str> = [
+            "debug",
+            "release",
+            "wasm-dev",
+            "wasm-release",
+            "wasm32-unknown-unknown/wasm-dev",
+        ]
+        .iter()
+        .map(|p| profile_color(p))
+        .collect();
+        // At least two distinct colors among the 5 profiles
+        let unique: std::collections::HashSet<_> = colors.iter().collect();
+        assert!(
+            unique.len() >= 2,
+            "expected distinct colors for different profiles"
+        );
+    }
+
+    // ── format_artifact_line ──────────────────────────────────────────────────
+
+    #[test]
+    fn format_artifact_line_in_use_contains_crate_name() {
+        let line = format_artifact_line(1, "debug", "libserde-abc123.rlib", 1024, None, &IN_USE);
+        // Should contain the crate name somewhere (stripped of ANSI)
+        assert!(line.contains("serde"), "line: {line:?}");
+        assert!(line.contains("debug"), "line: {line:?}");
+        assert!(line.contains("1.00 KiB"), "line: {line:?}");
+    }
+
+    #[test]
+    fn format_artifact_line_to_remove_has_no_index() {
+        let line = format_artifact_line(3, "release", "libfoo-hash.rmeta", 2048, None, &TO_REMOVE);
+        // TO_REMOVE uses an icon, not "  3."
+        assert!(!line.contains("  3."), "should not have index: {line:?}");
+        assert!(line.contains("foo"), "line: {line:?}");
+    }
+
+    #[test]
+    fn format_artifact_line_in_use_shows_index() {
+        let line = format_artifact_line(7, "debug", "libfoo-hash.rlib", 512, None, &IN_USE);
+        assert!(line.contains("7."), "should contain index: {line:?}");
+    }
+
+    #[test]
+    fn format_artifact_line_used_by_annotation() {
+        let line = format_artifact_line(
+            1,
+            "debug",
+            "libserde-abc.rlib",
+            100,
+            Some(&["my_crate"]),
+            &IN_USE,
+        );
+        assert!(line.contains("my_crate"), "line: {line:?}");
+    }
+
+    #[test]
+    fn format_more_line_output() {
+        let line = format_more_line(42, "files");
+        assert!(line.contains("42"), "line: {line:?}");
+        assert!(line.contains("files"), "line: {line:?}");
+    }
+}

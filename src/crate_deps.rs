@@ -37,3 +37,42 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn crate_key_strips_lib_prefix_and_hash() {
+        assert_eq!(crate_key(&PathBuf::from("libserde-abc123.rlib")), "serde");
+        assert_eq!(
+            crate_key(&PathBuf::from("libregex_automata-0b81c4f4.rlib")),
+            "regex_automata"
+        );
+        assert_eq!(crate_key(&PathBuf::from("libfoo-HASH.rmeta")), "foo");
+    }
+
+    #[test]
+    fn crate_key_no_lib_prefix() {
+        assert_eq!(
+            crate_key(&PathBuf::from("cargo_clean-abc.d")),
+            "cargo_clean"
+        );
+    }
+
+    #[test]
+    fn crate_key_no_hash() {
+        assert_eq!(crate_key(&PathBuf::from("libserde.rlib")), "serde");
+    }
+
+    #[test]
+    fn format_bytes_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.00 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.00 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GiB");
+        assert_eq!(format_bytes(1536), "1.50 KiB");
+    }
+}

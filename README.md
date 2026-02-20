@@ -8,9 +8,10 @@ Prune stale Rust build artifacts from `target/` by tracing which files are
 actually referenced during a build — not guessing.
 
 Run your build command once; `cargo-clean-artifact` captures the artifact
-paths cargo logs, removes everything in `target/{profile}/deps/` that was
-**not** referenced, and leaves everything that was needed intact so the next
-build requires zero recompilation.
+paths cargo's fingerprint engine logs, removes everything in
+`target/{profile}/deps/` that was **not** referenced, and also cleans up
+stale incremental compilation sessions — leaving only what the next build
+actually needs, so it requires zero recompilation.
 
 ## Installation
 
@@ -60,6 +61,7 @@ cargo clean-artifact -c "cargo build" -v
 | `-c, --command <CMD>` | Build command to trace (**required**) |
 | `-y, --yes` | Remove files without confirmation |
 | `--dry-run` | Preview what would be removed (default) |
+| `-n, --trace-stats <N>` | Show top N largest in-use artifacts (default: 5) |
 | `-v, --verbose` | Debug logging (target dir, command, …) |
 | `--allow-shared-target-dir` | Allow cleaning a shared/global `CARGO_TARGET_DIR` |
 | `[DIR]` | Directory to clean (default: `.`) |
@@ -69,25 +71,32 @@ cargo clean-artifact -c "cargo build" -v
 1. **Trace**: Runs your build command with
    `CARGO_LOG=cargo::core::compiler::fingerprint=trace` and captures every
    artifact path that cargo's fingerprint engine references (`.rlib`,
-   `.rmeta`, `.so`, `.dylib`, `.dll`, …).
+   `.rmeta`, `.so`, `.dylib`, `.dll`, `.wasm`, …).
 
-2. **Scan**: Collects all files in the `deps/` directories that appeared in
-   the trace (e.g. `target/debug/deps/`, `target/wasm32-unknown-unknown/wasm-dev/deps/`).
-   Files outside those directories are never touched.
+2. **Scan `deps/`**: Collects all files in the `deps/` directories that
+   appeared in the trace (e.g. `target/debug/deps/`,
+   `target/wasm32-unknown-unknown/wasm-dev/deps/`). Files outside those
+   directories are never touched.
 
-3. **Protect output artifacts**: Files sitting directly in `target/{profile}/`
+3. **Scan `incremental/`**: For each profile, groups the incremental
+   compilation session directories by crate name and keeps only the
+   most-recently-modified session per crate. All older sessions are
+   marked for removal.
+
+4. **Protect output artifacts**: Files sitting directly in `target/{profile}/`
    (the final linked binary, `.rlib`, `.wasm`, etc.) are never removed, even
    if they didn't appear in the trace.
 
-4. **Remove**: Everything in the scanned `deps/` directories that was **not**
-   referenced is deleted. Only profiles/targets that appeared in your build
-   are touched — a wasm build will never clean your native `debug/` artifacts.
+5. **Remove** (step-by-step confirmation): Prompts separately for stale
+   `deps/` artifacts and stale incremental sessions, then asks for a final
+   combined confirmation before touching anything.
 
 ### Profile / target isolation
 
 The tool only cleans directories it actually observed in the trace. If you
 run `cargo clean-artifact -c "trunk build"` it will only scan the wasm
-profile's `deps/` folder, leaving `target/debug/` completely untouched.
+profile's `deps/` and `incremental/` folders, leaving `target/debug/`
+completely untouched.
 
 ### Idempotency
 
@@ -105,15 +114,29 @@ anything.
 ────────────────────────────────────────────────────────────────
 ✅ Traced 247 artifacts in use  (312.50 MiB)
 
-📊 Summary: 42 files (180.23 MiB) can be removed  •  312.50 MiB in use
+📂 Build profiles: release
+
+📦 Top 5 in-use artifacts (247 total):
+    1. release libjiff-69bb3ab00abe931c.rlib (8.25 MiB) ← my-crate
+    2. release libsyn-f41f8c7f54cf32d8.rlib (8.25 MiB) ← my-crate
+    3. release libtokio-ffc43fdca28ca7f4.rmeta (7.34 MiB) ← my-crate
+    … and 244 more in-use files
 
 By profile:
-  release: 42 files (180.23 MiB)
+  release: [312.50 MiB kept / 493.00 MiB total dir]
 
-Top files to remove:
-  1. release libserde-old1234abcd.rlib (45.10 MiB)
-  2. release libsyn-old5678efgh.rlib  (38.70 MiB)
-  ...
+🗑  Top files to remove: ▶
+  🗑  release libtokio-oldabcd1234.rlib (8.85 MiB)
+  🗑  release libsyn-old5678efgh.rlib (8.25 MiB)
+  … and 37 more files
 
-❯ Remove 42 files (180.23 MiB)? [y/N]:
+❯ Remove 42 stale artifact files (180.23 MiB)? [y/N]: y
+
+🗂  Stale incremental sessions:
+  🗑  my_crate-1893d467y0y5b (45.10 MiB)
+  🗑  serde-3743rt092g0bi (12.30 MiB)
+  … and 3 more stale sessions
+❯ Remove 5 stale incremental dirs (89.40 MiB)? [y/N]: y
+
+❯ Remove 42 files + 5 stale incremental dirs (269.63 MiB)? [y/N]: y
 ```

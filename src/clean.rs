@@ -76,6 +76,8 @@ pub(super) struct CleanupStats {
     pub(super) per_profile: HashMap<String, ProfileStat>,
     pub(super) errors: HashMap<(String, String, String), anyhow::Error>,
     pub(super) files_to_remove: Vec<FileToRemove>,
+    /// Stale incremental compilation session directories to remove
+    pub(super) dirs_to_remove: Vec<DirToRemove>,
 }
 
 #[derive(Default, Clone)]
@@ -101,6 +103,13 @@ pub(super) struct FileToRemove {
     pub(super) profile: String,
 }
 
+#[derive(Clone)]
+pub(super) struct DirToRemove {
+    pub(super) path: PathBuf,
+    pub(super) size: u64,
+    pub(super) profile: String,
+}
+
 impl CleanupStats {
     pub(super) fn merge_from(&mut self, other: CleanupStats) {
         self.files += other.files;
@@ -120,6 +129,7 @@ impl CleanupStats {
         }
         self.errors.extend(other.errors);
         self.files_to_remove.extend(other.files_to_remove);
+        self.dirs_to_remove.extend(other.dirs_to_remove);
     }
 }
 
@@ -305,6 +315,14 @@ impl CleanCommand {
                 .or_default()
                 .total_dir_bytes = total_dir_bytes;
 
+            // Clean stale incremental sessions for this profile
+            if let Some(profile_dir) = deps_dir.parent() {
+                match CleanCommand::clean_incremental_dir(profile_dir, display_profile).await {
+                    Ok(inc_stats) => profile_stats.merge_from(inc_stats),
+                    Err(e) => log::warn!("Failed to scan incremental dir: {e}"),
+                }
+            }
+
             stats.merge_from(profile_stats);
         }
 
@@ -434,6 +452,82 @@ impl CleanCommand {
 
         Ok(stats)
     }
+
+    /// Scan `<profile_dir>/incremental/` and mark stale sessions for removal.
+    ///
+    /// Cargo stores incremental data in directories named `<crate_name>-<session_hash>/`.
+    /// Multiple stale sessions accumulate over time. We keep only the most-recently
+    /// modified session per crate name and mark the rest for removal.
+    async fn clean_incremental_dir(profile_dir: &Path, profile: &str) -> Result<CleanupStats> {
+        let incremental_dir = profile_dir.join("incremental");
+        let mut stats = CleanupStats::default();
+
+        if !incremental_dir.exists() {
+            return Ok(stats);
+        }
+
+        // Collect all subdirectory entries with their mtime
+        let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+        let mut dir_iter = fs::read_dir(&incremental_dir).await?;
+        while let Some(entry) = dir_iter.next_entry().await? {
+            let path = entry.path();
+            if path.is_dir() {
+                let mtime = fs::metadata(&path)
+                    .await
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                entries.push((path, mtime));
+            }
+        }
+
+        // Group by crate name (split on last '-' to separate session hash)
+        let mut by_crate: HashMap<String, Vec<(PathBuf, std::time::SystemTime)>> = HashMap::new();
+        for (path, mtime) in entries {
+            let dir_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            // Split on last hyphen: <crate_name>-<session_hash>
+            let crate_name = match dir_name.rfind('-') {
+                Some(pos) => dir_name[..pos].to_string(),
+                None => dir_name,
+            };
+            by_crate.entry(crate_name).or_default().push((path, mtime));
+        }
+
+        // For each crate, keep the newest session, mark the rest for removal
+        for (_crate_name, mut sessions) in by_crate {
+            if sessions.len() <= 1 {
+                continue;
+            }
+            // Sort newest first
+            sessions.sort_by(|a, b| b.1.cmp(&a.1));
+            // Keep index 0 (newest), remove the rest
+            for (path, _) in sessions.into_iter().skip(1) {
+                let size = dir_size_bytes(&path);
+                stats.dirs_to_remove.push(DirToRemove {
+                    path,
+                    size,
+                    profile: profile.to_string(),
+                });
+                stats.files += 1;
+                stats.bytes += size;
+                stats
+                    .per_profile
+                    .entry(profile.to_string())
+                    .or_default()
+                    .files += 1;
+                stats
+                    .per_profile
+                    .entry(profile.to_string())
+                    .or_default()
+                    .bytes += size;
+            }
+        }
+
+        Ok(stats)
+    }
 } // end impl CleanCommand (first block)
 
 /// Recursively sum the size of all files under `dir` (sync, no extra deps).
@@ -475,19 +569,32 @@ fn artifact_stem(path: &Path) -> Option<String> {
 }
 
 impl CleanCommand {
-    async fn actually_remove_files(&self, stats: &CleanupStats) -> Result<CleanupStats> {
+    async fn actually_remove_files(
+        &self,
+        stats: &CleanupStats,
+        sel: &RemovalSelection,
+    ) -> Result<CleanupStats> {
         let mut removal_stats = CleanupStats::default();
 
-        let pb = ProgressBar::new(stats.files as u64);
+        let total = if sel.remove_files {
+            stats.files_to_remove.len()
+        } else {
+            0
+        } + if sel.remove_dirs {
+            stats.dirs_to_remove.len()
+        } else {
+            0
+        };
+        let pb = ProgressBar::new(total as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} files ({bytes_per_sec}) {msg}")
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} items ({bytes_per_sec}) {msg}")
                 .unwrap()
                 .progress_chars("=>-"),
         );
         pb.set_message("Removing...");
 
-        for file_info in &stats.files_to_remove {
+        for file_info in stats.files_to_remove.iter().filter(|_| sel.remove_files) {
             let crate_key = crate_key(&file_info.path);
             match fs::remove_file(&file_info.path).await {
                 Ok(_) => {
@@ -512,6 +619,32 @@ impl CleanCommand {
                             crate_key.clone(),
                             file_info.profile.clone(),
                             file_info.path.display().to_string(),
+                        ),
+                        e.into(),
+                    );
+                }
+            }
+            pb.inc(1);
+        }
+
+        for dir_info in stats.dirs_to_remove.iter().filter(|_| sel.remove_dirs) {
+            match fs::remove_dir_all(&dir_info.path).await {
+                Ok(_) => {
+                    removal_stats.files += 1;
+                    removal_stats.bytes += dir_info.size;
+                    let profile_entry = removal_stats
+                        .per_profile
+                        .entry(dir_info.profile.clone())
+                        .or_default();
+                    profile_entry.files += 1;
+                    profile_entry.bytes += dir_info.size;
+                }
+                Err(e) => {
+                    removal_stats.errors.insert(
+                        (
+                            String::from("incremental"),
+                            dir_info.profile.clone(),
+                            dir_info.path.display().to_string(),
                         ),
                         e.into(),
                     );
@@ -629,14 +762,19 @@ impl CleanCommand {
         print_detailed_summary(&total_stats);
 
         // Interactive confirmation if not in --yes mode
-        let should_remove = if !self.yes {
-            prompt_confirmation(&total_stats)?
+        let selection = if !self.yes {
+            prompt_step_by_step(&total_stats)?
+        } else if !self.dry_run {
+            RemovalSelection {
+                remove_files: true,
+                remove_dirs: true,
+            }
         } else {
-            !self.dry_run || self.yes
+            RemovalSelection::default()
         };
 
-        if should_remove {
-            let removal_stats = self.actually_remove_files(&total_stats).await?;
+        if selection.any() {
+            let removal_stats = self.actually_remove_files(&total_stats, &selection).await?;
             print_removal_summary(&removal_stats);
         } else {
             print_dry_run_summary(&total_stats);
@@ -646,25 +784,125 @@ impl CleanCommand {
     }
 }
 
-fn prompt_confirmation(stats: &CleanupStats) -> Result<bool> {
+/// Which categories the user chose to remove in the step-by-step prompt.
+#[derive(Default)]
+struct RemovalSelection {
+    remove_files: bool,
+    remove_dirs: bool,
+}
+
+impl RemovalSelection {
+    fn any(&self) -> bool {
+        self.remove_files || self.remove_dirs
+    }
+}
+
+fn ask_yes_no(prompt: &str) -> Result<bool> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let answer = input.trim().to_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
+fn prompt_step_by_step(stats: &CleanupStats) -> Result<RemovalSelection> {
     let color = io::stdout().is_terminal();
     let prompt_style = Style::new().fg_color(Some(AnsiColor::Yellow.into())).bold();
     let size_style = Style::new().fg_color(Some(AnsiColor::Cyan.into())).bold();
+    let dim_style = Style::new().fg_color(Some(AnsiColor::BrightBlack.into()));
+    let mut sel = RemovalSelection::default();
 
-    println!();
-    println!(
-        "{} Remove {} files ({})? [y/N]: ",
-        paint(color, "❯", prompt_style),
-        paint(color, stats.files.to_string(), size_style),
-        paint(color, format_bytes(stats.bytes), size_style),
-    );
+    // ── Step 1: stale artifact files ─────────────────────────────────────────
+    if !stats.files_to_remove.is_empty() {
+        let files_bytes: u64 = stats.files_to_remove.iter().map(|f| f.size).sum();
+        let prompt = format!(
+            "{} Remove {} stale artifact files ({})? [y/N]: ",
+            paint(color, "❯", prompt_style),
+            paint(color, stats.files_to_remove.len().to_string(), size_style),
+            paint(color, format_bytes(files_bytes), size_style),
+        );
+        sel.remove_files = ask_yes_no(&prompt)?;
+    }
 
-    let mut input = String::new();
-    io::stdout().flush()?;
-    io::stdin().read_line(&mut input)?;
+    // ── Step 2: stale incremental dirs ───────────────────────────────────────
+    if !stats.dirs_to_remove.is_empty() {
+        // Show top stale incremental dirs sorted by size
+        let mut sorted_dirs = stats.dirs_to_remove.clone();
+        sorted_dirs.sort_by_key(|d| std::cmp::Reverse(d.size));
+        let dirs_bytes: u64 = sorted_dirs.iter().map(|d| d.size).sum();
 
-    let answer = input.trim().to_lowercase();
-    Ok(answer == "y" || answer == "yes")
+        println!();
+        println!(
+            "{}",
+            paint(color, "🗂  Stale incremental sessions:", Style::new().bold())
+        );
+        let show_n = 5.min(sorted_dirs.len());
+        for dir in sorted_dirs.iter().take(show_n) {
+            let name = dir.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            println!(
+                "  {}  {} {}",
+                paint(
+                    color,
+                    "🗑",
+                    Style::new().fg_color(Some(AnsiColor::Red.into()))
+                ),
+                paint(color, name, dim_style),
+                paint(color, format!("({})", format_bytes(dir.size)), size_style),
+            );
+        }
+        if sorted_dirs.len() > show_n {
+            println!(
+                "  {}",
+                paint(
+                    color,
+                    format!("… and {} more stale sessions", sorted_dirs.len() - show_n),
+                    dim_style
+                )
+            );
+        }
+
+        let prompt = format!(
+            "{} Remove {} stale incremental dirs ({})? [y/N]: ",
+            paint(color, "❯", prompt_style),
+            paint(color, sorted_dirs.len().to_string(), size_style),
+            paint(color, format_bytes(dirs_bytes), size_style),
+        );
+        sel.remove_dirs = ask_yes_no(&prompt)?;
+    }
+
+    // ── Final combined confirmation ───────────────────────────────────────────
+    if sel.any() {
+        let mut parts: Vec<String> = Vec::new();
+        let mut total_bytes = 0u64;
+        if sel.remove_files {
+            let b: u64 = stats.files_to_remove.iter().map(|f| f.size).sum();
+            parts.push(format!("{} files", stats.files_to_remove.len()));
+            total_bytes += b;
+        }
+        if sel.remove_dirs {
+            let b: u64 = stats.dirs_to_remove.iter().map(|d| d.size).sum();
+            parts.push(format!(
+                "{} stale incremental dirs",
+                stats.dirs_to_remove.len()
+            ));
+            total_bytes += b;
+        }
+        let desc = parts.join(" + ");
+        let prompt = format!(
+            "\n{} Remove {} ({})? [y/N]: ",
+            paint(color, "❯", prompt_style),
+            paint(color, desc, size_style),
+            paint(color, format_bytes(total_bytes), size_style),
+        );
+        let confirmed = ask_yes_no(&prompt)?;
+        if !confirmed {
+            sel.remove_files = false;
+            sel.remove_dirs = false;
+        }
+    }
+
+    Ok(sel)
 }
 
 fn print_profile_breakdown(stats: &CleanupStats) {
@@ -863,4 +1101,154 @@ fn print_errors(stats: &CleanupStats, color: bool) {
         );
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
+    // ── artifact_stem ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn artifact_stem_rlib() {
+        assert_eq!(
+            artifact_stem(Path::new("libserde-abc123.rlib")),
+            Some("serde-abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn artifact_stem_rmeta() {
+        assert_eq!(
+            artifact_stem(Path::new("libregex_automata-0b81c4f4.rmeta")),
+            Some("regex_automata-0b81c4f4".to_string())
+        );
+    }
+
+    #[test]
+    fn artifact_stem_d_file_no_lib() {
+        assert_eq!(
+            artifact_stem(Path::new("cargo_clean-abc.d")),
+            Some("cargo_clean-abc".to_string())
+        );
+    }
+
+    #[test]
+    fn artifact_stem_multi_ext() {
+        // foo-HASH.foo.cgu.00.rcgu.dwo → foo-HASH
+        assert_eq!(
+            artifact_stem(Path::new("foo-HASH.foo.cgu.00.rcgu.dwo")),
+            Some("foo-HASH".to_string())
+        );
+    }
+
+    #[test]
+    fn artifact_stem_no_hash_returns_none() {
+        // No '-' in stem → not a valid artifact
+        assert_eq!(artifact_stem(Path::new("libserde.rlib")), None);
+    }
+
+    #[test]
+    fn artifact_stem_strips_lib_prefix() {
+        // lib prefix should be stripped before checking for '-'
+        let s = artifact_stem(Path::new("libfoo-abc.rlib")).unwrap();
+        assert_eq!(s, "foo-abc");
+        assert!(!s.starts_with("lib"));
+    }
+
+    // ── clean_incremental_dir ─────────────────────────────────────────────────
+
+    /// Helper: create a directory and touch its mtime `offset` seconds in the past.
+    fn make_session(base: &Path, name: &str, age_secs: u64) {
+        let dir = base.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        // Write a dummy file so the dir has content
+        fs::write(dir.join("data"), vec![0u8; 1024]).unwrap();
+        // Set mtime to `age_secs` seconds ago
+        let mtime = SystemTime::now() - Duration::from_secs(age_secs);
+        filetime::set_file_mtime(&dir, filetime::FileTime::from_system_time(mtime)).ok(); // ignore if filetime crate unavailable; mtime ordering still works
+    }
+
+    #[tokio::test]
+    async fn clean_incremental_keeps_newest_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inc = tmp.path().join("incremental");
+        fs::create_dir_all(&inc).unwrap();
+
+        // Three sessions for "bevy_pbr", oldest → newest
+        make_session(&inc, "bevy_pbr-1aaaaaaaaaaaa", 300); // oldest
+        make_session(&inc, "bevy_pbr-2bbbbbbbbbbb", 200);
+        make_session(&inc, "bevy_pbr-3ccccccccccc", 10); // newest
+
+        // One session for "serde" (should not be removed)
+        make_session(&inc, "serde-4ddddddddddd", 150);
+
+        let stats = CleanCommand::clean_incremental_dir(tmp.path(), "debug")
+            .await
+            .unwrap();
+
+        // Should mark 2 stale bevy_pbr sessions for removal (keep the newest)
+        assert_eq!(
+            stats.dirs_to_remove.len(),
+            2,
+            "dirs_to_remove: {:?}",
+            stats
+                .dirs_to_remove
+                .iter()
+                .map(|d| &d.path)
+                .collect::<Vec<_>>()
+        );
+
+        // Newest bevy_pbr should NOT be in the list
+        let removed_names: Vec<_> = stats
+            .dirs_to_remove
+            .iter()
+            .map(|d| d.path.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !removed_names.iter().any(|n| n.contains("3ccccccccccc")),
+            "newest session should be kept, got: {removed_names:?}"
+        );
+        assert!(
+            removed_names.iter().any(|n| n.contains("1aaaaaaaaaaaa")),
+            "oldest session should be removed"
+        );
+        assert!(
+            removed_names.iter().any(|n| n.contains("2bbbbbbbbbbb")),
+            "middle session should be removed"
+        );
+
+        // Single-session crate should never be touched
+        assert!(
+            !removed_names.iter().any(|n| n.contains("serde")),
+            "single-session crate should not be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_incremental_single_session_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inc = tmp.path().join("incremental");
+        fs::create_dir_all(&inc).unwrap();
+        make_session(&inc, "my_crate-1aaaaaaaaaaaa", 100);
+
+        let stats = CleanCommand::clean_incremental_dir(tmp.path(), "debug")
+            .await
+            .unwrap();
+
+        assert!(stats.dirs_to_remove.is_empty());
+        assert_eq!(stats.bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn clean_incremental_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No incremental/ dir at all
+        let stats = CleanCommand::clean_incremental_dir(tmp.path(), "debug")
+            .await
+            .unwrap();
+        assert!(stats.dirs_to_remove.is_empty());
+    }
 }
