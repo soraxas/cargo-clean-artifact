@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env,
-    io::{self, IsTerminal, Write},
+    io::IsTerminal,
     path::{Path, PathBuf},
 };
 
@@ -15,15 +15,27 @@ use tokio::fs;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::crate_deps::{crate_key, format_bytes, paint};
+use crate::crate_deps::{crate_key, paint};
 use crate::trace_parser::TraceParser;
+
+mod display;
+mod prompt;
+mod scan;
+mod stats;
+
+use display::{
+    print_detailed_summary, print_dry_run_summary, print_profile_breakdown, print_removal_summary,
+};
+use prompt::{RemovalSelection, prompt_step_by_step, select_command_interactive};
+use scan::{artifact_stem, dir_size_bytes};
+use stats::{CleanupStats, DirToRemove, FileToRemove};
 
 /// Clean unused, old project files.
 ///
 /// 1. This removes
 ///
 ///  - the unused files in `target` directory.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub(crate) struct CleanCommand {
     /// Actually remove files (dry-run is the default).
     #[clap(short = 'y', long = "yes")]
@@ -66,73 +78,6 @@ pub(crate) struct CleanCommand {
     trace_stats: usize,
 }
 
-#[derive(Default)]
-pub(super) struct CleanupStats {
-    pub(super) files: usize,
-    pub(super) bytes: u64,
-    /// Total size of artifacts kept (in use)
-    pub(super) used_bytes: u64,
-    pub(super) per_crate: HashMap<String, CrateStat>,
-    pub(super) per_profile: HashMap<String, ProfileStat>,
-    pub(super) errors: HashMap<(String, String, String), anyhow::Error>,
-    pub(super) files_to_remove: Vec<FileToRemove>,
-    /// Stale incremental compilation session directories to remove
-    pub(super) dirs_to_remove: Vec<DirToRemove>,
-}
-
-#[derive(Default, Clone)]
-pub(super) struct CrateStat {
-    pub(super) files: usize,
-    pub(super) bytes: u64,
-}
-
-#[derive(Default, Clone)]
-pub(super) struct ProfileStat {
-    pub(super) files: usize,
-    pub(super) bytes: u64,
-    /// Bytes in deps/ that are kept (in-use)
-    pub(super) used_bytes: u64,
-    /// Total bytes in the entire profile directory (deps + incremental + build + …)
-    pub(super) total_dir_bytes: u64,
-}
-
-#[derive(Clone)]
-pub(super) struct FileToRemove {
-    pub(super) path: PathBuf,
-    pub(super) size: u64,
-    pub(super) profile: String,
-}
-
-#[derive(Clone)]
-pub(super) struct DirToRemove {
-    pub(super) path: PathBuf,
-    pub(super) size: u64,
-    pub(super) profile: String,
-}
-
-impl CleanupStats {
-    pub(super) fn merge_from(&mut self, other: CleanupStats) {
-        self.files += other.files;
-        self.bytes += other.bytes;
-        self.used_bytes += other.used_bytes;
-        for (name, stat) in other.per_crate {
-            let entry = self.per_crate.entry(name).or_default();
-            entry.files += stat.files;
-            entry.bytes += stat.bytes;
-        }
-        for (profile, stat) in other.per_profile {
-            let entry = self.per_profile.entry(profile).or_default();
-            entry.files += stat.files;
-            entry.bytes += stat.bytes;
-            entry.used_bytes += stat.used_bytes;
-            entry.total_dir_bytes += stat.total_dir_bytes;
-        }
-        self.errors.extend(other.errors);
-        self.files_to_remove.extend(other.files_to_remove);
-        self.dirs_to_remove.extend(other.dirs_to_remove);
-    }
-}
-
 impl CleanCommand {
     /// Check if verbose mode is enabled
     pub fn is_verbose(&self) -> bool {
@@ -145,9 +90,8 @@ impl CleanCommand {
     pub(super) async fn remove_unused_files_of_cargo(
         &self,
         git_dir: &Path,
+        cmd: &str,
     ) -> Result<CleanupStats> {
-        let cmd = self.custom_command.as_deref().expect("command required");
-
         let metadata = MetadataCommand::new().current_dir(git_dir).exec();
 
         let metadata = match metadata {
@@ -528,47 +472,7 @@ impl CleanCommand {
 
         Ok(stats)
     }
-} // end impl CleanCommand (first block)
 
-/// Recursively sum the size of all files under `dir` (sync, no extra deps).
-fn dir_size_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(|e| e.ok())
-        .map(|e| {
-            let p = e.path();
-            if p.is_dir() {
-                dir_size_bytes(&p)
-            } else {
-                p.metadata().map(|m| m.len()).unwrap_or(0)
-            }
-        })
-        .sum()
-}
-
-/// Extract the `crate_name-HASH` stem from any artifact file:
-/// - `libfoo-HASH.rlib`              → `foo-HASH`
-/// - `libfoo-HASH.rmeta`             → `foo-HASH`
-/// - `foo-HASH.d`                    → `foo-HASH`
-/// - `foo-HASH.foo.cgu.00.rcgu.dwo`  → `foo-HASH`
-/// - `foo-HASH.foo.cgu.00.rcgu.o`    → `foo-HASH`
-fn artifact_stem(path: &Path) -> Option<String> {
-    let filename = path.file_name()?.to_str()?;
-    // Strip "lib" prefix (rlib/rmeta files carry it, dwo/o/d don't)
-    let without_lib = filename.strip_prefix("lib").unwrap_or(filename);
-    // Take everything before the first dot
-    let stem = without_lib.split_once('.').map_or(without_lib, |(s, _)| s);
-    // Must contain '-' (crate name / hash separator) to be a valid artifact
-    if stem.contains('-') {
-        Some(stem.to_string())
-    } else {
-        None
-    }
-}
-
-impl CleanCommand {
     async fn actually_remove_files(
         &self,
         stats: &CleanupStats,
@@ -595,15 +499,12 @@ impl CleanCommand {
         pb.set_message("Removing...");
 
         for file_info in stats.files_to_remove.iter().filter(|_| sel.remove_files) {
-            let crate_key = crate_key(&file_info.path);
+            let ck = crate_key(&file_info.path);
             match fs::remove_file(&file_info.path).await {
                 Ok(_) => {
                     removal_stats.files += 1;
                     removal_stats.bytes += file_info.size;
-                    let entry = removal_stats
-                        .per_crate
-                        .entry(crate_key.clone())
-                        .or_default();
+                    let entry = removal_stats.per_crate.entry(ck.clone()).or_default();
                     entry.files += 1;
                     entry.bytes += file_info.size;
                     let profile_entry = removal_stats
@@ -616,7 +517,7 @@ impl CleanCommand {
                 Err(e) => {
                     removal_stats.errors.insert(
                         (
-                            crate_key.clone(),
+                            ck.clone(),
                             file_info.profile.clone(),
                             file_info.path.display().to_string(),
                         ),
@@ -659,25 +560,33 @@ impl CleanCommand {
     }
 
     pub async fn run(self) -> Result<()> {
-        // Require --command; show a clap-style error with examples if missing
-        if self.custom_command.is_none() {
-            eprintln!(
-                "\x1b[1;31merror\x1b[0m: the following required arguments were not provided:"
-            );
-            eprintln!("  \x1b[32m-c, --command <COMMAND>\x1b[0m");
-            eprintln!();
-            eprintln!("Examples:");
-            eprintln!("  cargo-clean-artifact -c 'cargo build'");
-            eprintln!("  cargo-clean-artifact -c 'cargo build --release'");
-            eprintln!(
-                "  cargo-clean-artifact -c 'cargo build -F my_feat --target wasm32-unknown-unknown'"
-            );
-            eprintln!("  cargo-clean-artifact -c 'trunk build'");
-            eprintln!("  cargo-clean-artifact -c 'mise run my-build-task'");
-            eprintln!();
-            eprintln!("For more information, try '\x1b[1m--help\x1b[0m'.");
-            std::process::exit(2);
-        }
+        // Resolve the build command (interactive picker when -c is absent on a TTY)
+        let resolved_cmd: Option<String> = if self.custom_command.is_some() {
+            self.custom_command.clone()
+        } else {
+            match select_command_interactive()? {
+                Some(cmd) => Some(cmd),
+                None => {
+                    eprintln!(
+                        "\x1b[1;31merror\x1b[0m: the following required arguments were not provided:"
+                    );
+                    eprintln!("  \x1b[32m-c, --command <COMMAND>\x1b[0m");
+                    eprintln!();
+                    eprintln!("Examples:");
+                    eprintln!("  cargo-clean-artifact -c 'cargo build'");
+                    eprintln!("  cargo-clean-artifact -c 'cargo build --release'");
+                    eprintln!(
+                        "  cargo-clean-artifact -c 'cargo build -F my_feat --target wasm32-unknown-unknown'"
+                    );
+                    eprintln!("  cargo-clean-artifact -c 'trunk build'");
+                    eprintln!("  cargo-clean-artifact -c 'mise run my-build-task'");
+                    eprintln!();
+                    eprintln!("For more information, try '\x1b[1m--help\x1b[0m'.");
+                    std::process::exit(2);
+                }
+            }
+        };
+        let build_cmd = resolved_cmd.expect("command must be set");
 
         if let Ok(target_dir) = env::var("CARGO_TARGET_DIR") {
             let color = std::io::stderr().is_terminal();
@@ -729,7 +638,7 @@ impl CleanCommand {
 
         let remove_unused_files = async {
             let stats = try_join_all(dirs.iter().map(async |dir| {
-                self.remove_unused_files_of_cargo(dir.as_path())
+                self.remove_unused_files_of_cargo(dir.as_path(), &build_cmd)
                     .await
                     .with_context(|| {
                         format!("failed to clean up unused files in {}", dir.display())
@@ -781,474 +690,5 @@ impl CleanCommand {
         }
 
         Ok(())
-    }
-}
-
-/// Which categories the user chose to remove in the step-by-step prompt.
-#[derive(Default)]
-struct RemovalSelection {
-    remove_files: bool,
-    remove_dirs: bool,
-}
-
-impl RemovalSelection {
-    fn any(&self) -> bool {
-        self.remove_files || self.remove_dirs
-    }
-}
-
-fn ask_yes_no(prompt: &str) -> Result<bool> {
-    print!("{prompt}");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let answer = input.trim().to_lowercase();
-    Ok(answer == "y" || answer == "yes")
-}
-
-fn prompt_step_by_step(stats: &CleanupStats) -> Result<RemovalSelection> {
-    let color = io::stdout().is_terminal();
-    let prompt_style = Style::new().fg_color(Some(AnsiColor::Yellow.into())).bold();
-    let size_style = Style::new().fg_color(Some(AnsiColor::Cyan.into())).bold();
-    let dim_style = Style::new().fg_color(Some(AnsiColor::BrightBlack.into()));
-    let mut sel = RemovalSelection::default();
-
-    // ── Step 1: stale artifact files ─────────────────────────────────────────
-    if !stats.files_to_remove.is_empty() {
-        let files_bytes: u64 = stats.files_to_remove.iter().map(|f| f.size).sum();
-        let prompt = format!(
-            "{} Remove {} stale artifact files ({})? [y/N]: ",
-            paint(color, "❯", prompt_style),
-            paint(color, stats.files_to_remove.len().to_string(), size_style),
-            paint(color, format_bytes(files_bytes), size_style),
-        );
-        sel.remove_files = ask_yes_no(&prompt)?;
-    }
-
-    // ── Step 2: stale incremental dirs ───────────────────────────────────────
-    if !stats.dirs_to_remove.is_empty() {
-        // Show top stale incremental dirs sorted by size
-        let mut sorted_dirs = stats.dirs_to_remove.clone();
-        sorted_dirs.sort_by_key(|d| std::cmp::Reverse(d.size));
-        let dirs_bytes: u64 = sorted_dirs.iter().map(|d| d.size).sum();
-
-        println!();
-        println!(
-            "{}",
-            paint(color, "🗂  Stale incremental sessions:", Style::new().bold())
-        );
-        let show_n = 5.min(sorted_dirs.len());
-        for dir in sorted_dirs.iter().take(show_n) {
-            let name = dir.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            println!(
-                "  {}  {} {}",
-                paint(
-                    color,
-                    "🗑",
-                    Style::new().fg_color(Some(AnsiColor::Red.into()))
-                ),
-                paint(color, name, dim_style),
-                paint(color, format!("({})", format_bytes(dir.size)), size_style),
-            );
-        }
-        if sorted_dirs.len() > show_n {
-            println!(
-                "  {}",
-                paint(
-                    color,
-                    format!("… and {} more stale sessions", sorted_dirs.len() - show_n),
-                    dim_style
-                )
-            );
-        }
-
-        let prompt = format!(
-            "{} Remove {} stale incremental dirs ({})? [y/N]: ",
-            paint(color, "❯", prompt_style),
-            paint(color, sorted_dirs.len().to_string(), size_style),
-            paint(color, format_bytes(dirs_bytes), size_style),
-        );
-        sel.remove_dirs = ask_yes_no(&prompt)?;
-    }
-
-    // ── Final combined confirmation ───────────────────────────────────────────
-    if sel.any() {
-        let mut parts: Vec<String> = Vec::new();
-        let mut total_bytes = 0u64;
-        if sel.remove_files {
-            let b: u64 = stats.files_to_remove.iter().map(|f| f.size).sum();
-            parts.push(format!("{} files", stats.files_to_remove.len()));
-            total_bytes += b;
-        }
-        if sel.remove_dirs {
-            let b: u64 = stats.dirs_to_remove.iter().map(|d| d.size).sum();
-            parts.push(format!(
-                "{} stale incremental dirs",
-                stats.dirs_to_remove.len()
-            ));
-            total_bytes += b;
-        }
-        let desc = parts.join(" + ");
-        let prompt = format!(
-            "\n{} Remove {} ({})? [y/N]: ",
-            paint(color, "❯", prompt_style),
-            paint(color, desc, size_style),
-            paint(color, format_bytes(total_bytes), size_style),
-        );
-        let confirmed = ask_yes_no(&prompt)?;
-        if !confirmed {
-            sel.remove_files = false;
-            sel.remove_dirs = false;
-        }
-    }
-
-    Ok(sel)
-}
-
-fn print_profile_breakdown(stats: &CleanupStats) {
-    if stats.per_profile.is_empty() {
-        return;
-    }
-    let color = io::stdout().is_terminal();
-    let header_style = Style::new().fg_color(Some(AnsiColor::Cyan.into())).bold();
-
-    println!("{}", paint(color, "By profile:", header_style));
-    for (profile, profile_stat) in &stats.per_profile {
-        let total_suffix = if profile_stat.total_dir_bytes > 0 {
-            format!(
-                "  \x1b[2m[{} kept / {} total dir]\x1b[0m",
-                format_bytes(profile_stat.used_bytes),
-                format_bytes(profile_stat.total_dir_bytes),
-            )
-        } else {
-            String::new()
-        };
-        let to_remove = if profile_stat.files > 0 {
-            format!(
-                "  \x1b[31m-{} files ({})\x1b[0m",
-                profile_stat.files,
-                format_bytes(profile_stat.bytes)
-            )
-        } else {
-            String::new()
-        };
-        println!(
-            "  {}{}:\x1b[0m\x1b[0m{}{}",
-            crate::theme::profile_color(profile),
-            profile,
-            total_suffix,
-            to_remove,
-        );
-    }
-    println!();
-}
-
-fn print_detailed_summary(stats: &CleanupStats) {
-    let color = io::stdout().is_terminal();
-    let header_style = Style::new().fg_color(Some(AnsiColor::Cyan.into())).bold();
-    let _profile_style = Style::new().fg_color(Some(AnsiColor::Magenta.into()));
-    let size_style = Style::new().fg_color(Some(AnsiColor::Green.into()));
-    let dim_style = Style::new().fg_color(Some(AnsiColor::BrightBlack.into()));
-
-    println!();
-    println!(
-        "{} {}{}",
-        paint(color, "📊 Summary:", header_style),
-        paint(
-            color,
-            format!(
-                "{} files ({}) can be removed",
-                stats.files,
-                format_bytes(stats.bytes)
-            ),
-            size_style
-        ),
-        if stats.used_bytes > 0 {
-            paint(
-                color,
-                format!("  •  {} in use", format_bytes(stats.used_bytes)),
-                dim_style,
-            )
-        } else {
-            String::new()
-        }
-    );
-    println!();
-
-    // Show top 10 files to be removed
-    if color {
-        // Red powerline-style header: red bg + bold white text + right-pointing arrow cap
-        println!("\x1b[41;1;97m 🗑  Files to remove: \x1b[0m\x1b[31m\u{e0b0}\x1b[0m");
-    } else {
-        println!("{}", paint(color, "Files to remove:", header_style));
-    }
-    let mut files_sorted = stats.files_to_remove.clone();
-    files_sorted.sort_by_key(|f| std::cmp::Reverse(f.size));
-
-    for (i, file_info) in files_sorted.iter().take(10).enumerate() {
-        let filename = file_info
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-        println!(
-            "{}",
-            crate::theme::format_artifact_line(
-                i + 1,
-                &file_info.profile,
-                filename,
-                file_info.size,
-                None,
-                &crate::theme::TO_REMOVE,
-            )
-        );
-    }
-
-    if files_sorted.len() > 10 {
-        println!(
-            "{}",
-            crate::theme::format_more_line(files_sorted.len() - 10, "files")
-        );
-    }
-}
-
-fn print_removal_summary(stats: &CleanupStats) {
-    let color = io::stdout().is_terminal();
-    let success_style = Style::new().fg_color(Some(AnsiColor::Green.into())).bold();
-    let accent_style = Style::new().fg_color(Some(AnsiColor::Cyan.into()));
-
-    println!();
-    println!(
-        "{} {} files ({}) across {} crates",
-        paint(color, "✓ Removed", success_style),
-        paint(color, stats.files.to_string(), accent_style),
-        paint(color, format_bytes(stats.bytes), accent_style),
-        paint(color, stats.per_crate.len().to_string(), accent_style),
-    );
-
-    print_top_crates(stats, color);
-    print_errors(stats, color);
-}
-
-fn print_dry_run_summary(stats: &CleanupStats) {
-    let color = io::stdout().is_terminal();
-    let dry_run_style = Style::new().fg_color(Some(AnsiColor::Yellow.into()));
-    let accent_style = Style::new().fg_color(Some(AnsiColor::Cyan.into()));
-
-    println!();
-    println!(
-        "{} would remove {} files ({}) across {} crates",
-        paint(color, "Dry-run:", dry_run_style),
-        paint(color, stats.files.to_string(), accent_style),
-        paint(color, format_bytes(stats.bytes), accent_style),
-        paint(color, stats.per_crate.len().to_string(), accent_style),
-    );
-
-    print_top_crates(stats, color);
-}
-
-fn print_top_crates(stats: &CleanupStats, color: bool) {
-    let mut crates: Vec<_> = stats.per_crate.iter().collect();
-    crates.sort_by_key(|(name, stat)| (std::cmp::Reverse(stat.bytes), name.to_string()));
-
-    let accent_style = Style::new().fg_color(Some(AnsiColor::Cyan.into()));
-
-    const MAX_CRATES: usize = 20;
-    for (name, stat) in crates.iter().take(MAX_CRATES) {
-        println!(
-            "  - {}: {} files ({})",
-            paint(color, name, accent_style),
-            paint(color, stat.files.to_string(), accent_style),
-            paint(color, format_bytes(stat.bytes), accent_style)
-        );
-    }
-
-    if crates.len() > MAX_CRATES {
-        println!(
-            "  ... and {} more crates",
-            paint(color, (crates.len() - MAX_CRATES).to_string(), accent_style)
-        );
-    }
-}
-
-fn print_errors(stats: &CleanupStats, color: bool) {
-    if stats.errors.is_empty() {
-        return;
-    }
-
-    let error_headline_style = Style::new().fg_color(Some(AnsiColor::Red.into())).bold();
-    let error_accent_style = Style::new().fg_color(Some(AnsiColor::Cyan.into()));
-    let error_crate_style = Style::new().fg_color(Some(AnsiColor::Yellow.into()));
-    let error_flavor_style = Style::new().fg_color(Some(AnsiColor::Magenta.into()));
-    let error_file_style = Style::new().fg_color(Some(AnsiColor::Blue.into()));
-
-    println!(
-        "\n{} {}",
-        paint(color, "Errors:", error_headline_style),
-        paint(
-            color,
-            format!("({} files)", stats.errors.len()),
-            error_accent_style
-        )
-    );
-    for ((crate_name, flavor, file), error) in stats.errors.iter() {
-        println!(
-            "  {} [{}]: {} -> {}",
-            paint(color, crate_name, error_crate_style),
-            paint(color, flavor, error_flavor_style),
-            paint(color, file, error_file_style),
-            paint(color, format!("{error}"), error_headline_style),
-        );
-    }
-    println!();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::time::{Duration, SystemTime};
-
-    // ── artifact_stem ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn artifact_stem_rlib() {
-        assert_eq!(
-            artifact_stem(Path::new("libserde-abc123.rlib")),
-            Some("serde-abc123".to_string())
-        );
-    }
-
-    #[test]
-    fn artifact_stem_rmeta() {
-        assert_eq!(
-            artifact_stem(Path::new("libregex_automata-0b81c4f4.rmeta")),
-            Some("regex_automata-0b81c4f4".to_string())
-        );
-    }
-
-    #[test]
-    fn artifact_stem_d_file_no_lib() {
-        assert_eq!(
-            artifact_stem(Path::new("cargo_clean-abc.d")),
-            Some("cargo_clean-abc".to_string())
-        );
-    }
-
-    #[test]
-    fn artifact_stem_multi_ext() {
-        // foo-HASH.foo.cgu.00.rcgu.dwo → foo-HASH
-        assert_eq!(
-            artifact_stem(Path::new("foo-HASH.foo.cgu.00.rcgu.dwo")),
-            Some("foo-HASH".to_string())
-        );
-    }
-
-    #[test]
-    fn artifact_stem_no_hash_returns_none() {
-        // No '-' in stem → not a valid artifact
-        assert_eq!(artifact_stem(Path::new("libserde.rlib")), None);
-    }
-
-    #[test]
-    fn artifact_stem_strips_lib_prefix() {
-        // lib prefix should be stripped before checking for '-'
-        let s = artifact_stem(Path::new("libfoo-abc.rlib")).unwrap();
-        assert_eq!(s, "foo-abc");
-        assert!(!s.starts_with("lib"));
-    }
-
-    // ── clean_incremental_dir ─────────────────────────────────────────────────
-
-    /// Helper: create a directory and touch its mtime `offset` seconds in the past.
-    fn make_session(base: &Path, name: &str, age_secs: u64) {
-        let dir = base.join(name);
-        fs::create_dir_all(&dir).unwrap();
-        // Write a dummy file so the dir has content
-        fs::write(dir.join("data"), vec![0u8; 1024]).unwrap();
-        // Set mtime to `age_secs` seconds ago
-        let mtime = SystemTime::now() - Duration::from_secs(age_secs);
-        filetime::set_file_mtime(&dir, filetime::FileTime::from_system_time(mtime)).ok(); // ignore if filetime crate unavailable; mtime ordering still works
-    }
-
-    #[tokio::test]
-    async fn clean_incremental_keeps_newest_session() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inc = tmp.path().join("incremental");
-        fs::create_dir_all(&inc).unwrap();
-
-        // Three sessions for "bevy_pbr", oldest → newest
-        make_session(&inc, "bevy_pbr-1aaaaaaaaaaaa", 300); // oldest
-        make_session(&inc, "bevy_pbr-2bbbbbbbbbbb", 200);
-        make_session(&inc, "bevy_pbr-3ccccccccccc", 10); // newest
-
-        // One session for "serde" (should not be removed)
-        make_session(&inc, "serde-4ddddddddddd", 150);
-
-        let stats = CleanCommand::clean_incremental_dir(tmp.path(), "debug")
-            .await
-            .unwrap();
-
-        // Should mark 2 stale bevy_pbr sessions for removal (keep the newest)
-        assert_eq!(
-            stats.dirs_to_remove.len(),
-            2,
-            "dirs_to_remove: {:?}",
-            stats
-                .dirs_to_remove
-                .iter()
-                .map(|d| &d.path)
-                .collect::<Vec<_>>()
-        );
-
-        // Newest bevy_pbr should NOT be in the list
-        let removed_names: Vec<_> = stats
-            .dirs_to_remove
-            .iter()
-            .map(|d| d.path.file_name().unwrap().to_str().unwrap().to_string())
-            .collect();
-        assert!(
-            !removed_names.iter().any(|n| n.contains("3ccccccccccc")),
-            "newest session should be kept, got: {removed_names:?}"
-        );
-        assert!(
-            removed_names.iter().any(|n| n.contains("1aaaaaaaaaaaa")),
-            "oldest session should be removed"
-        );
-        assert!(
-            removed_names.iter().any(|n| n.contains("2bbbbbbbbbbb")),
-            "middle session should be removed"
-        );
-
-        // Single-session crate should never be touched
-        assert!(
-            !removed_names.iter().any(|n| n.contains("serde")),
-            "single-session crate should not be removed"
-        );
-    }
-
-    #[tokio::test]
-    async fn clean_incremental_single_session_untouched() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inc = tmp.path().join("incremental");
-        fs::create_dir_all(&inc).unwrap();
-        make_session(&inc, "my_crate-1aaaaaaaaaaaa", 100);
-
-        let stats = CleanCommand::clean_incremental_dir(tmp.path(), "debug")
-            .await
-            .unwrap();
-
-        assert!(stats.dirs_to_remove.is_empty());
-        assert_eq!(stats.bytes, 0);
-    }
-
-    #[tokio::test]
-    async fn clean_incremental_empty_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        // No incremental/ dir at all
-        let stats = CleanCommand::clean_incremental_dir(tmp.path(), "debug")
-            .await
-            .unwrap();
-        assert!(stats.dirs_to_remove.is_empty());
     }
 }
