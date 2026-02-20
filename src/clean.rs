@@ -233,33 +233,48 @@ impl CleanCommand {
                 shown, total
             );
             for (i, (path, size)) in sized.iter().take(n).enumerate() {
-                let rel = path
-                    .strip_prefix(target_dir)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| path.display().to_string());
-                // Strip deps/ prefix for a shorter display: "debug/deps/libfoo…" → "debug libfoo…"
-                let rel_short = rel.replace("/deps/", " ").replace("\\deps\\", " ");
-                // Who uses this artifact?
-                let users: String = trace_result
+                // Derive profile and filename separately
+                let rel = path.strip_prefix(target_dir).ok();
+                let profile = rel
+                    .and_then(|r| r.parent()) // strip filename
+                    .and_then(|r| r.parent()) // strip "deps"
+                    .map(|r| r.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
+                let users: Vec<&str> = trace_result
                     .used_by
                     .get(path)
                     .map(|s| {
                         let mut v: Vec<&str> = s.iter().map(|x| x.as_str()).collect();
                         v.sort();
-                        v.truncate(3);
-                        format!(" \x1b[2m← {}\x1b[0m", v.join(", "))
+                        v
                     })
                     .unwrap_or_default();
+                let used_by = if users.is_empty() {
+                    None
+                } else {
+                    Some(users.as_slice())
+                };
                 println!(
-                    "  \x1b[2m{:>3}.\x1b[0m \x1b[1m{}\x1b[0m \x1b[32m({})\x1b[0m{}",
-                    i + 1,
-                    rel_short,
-                    format_bytes(*size),
-                    users,
+                    "{}",
+                    crate::theme::format_artifact_line(
+                        i + 1,
+                        &profile,
+                        filename,
+                        *size,
+                        used_by,
+                        &crate::theme::IN_USE
+                    )
                 );
             }
             if total > n {
-                println!("  \x1b[2m  … and {} more in-use files\x1b[0m", total - n);
+                println!(
+                    "{}",
+                    crate::theme::format_more_line(total - n, "in-use files")
+                );
             }
             println!();
         }
@@ -653,7 +668,6 @@ fn print_detailed_summary(stats: &CleanupStats) {
     let color = io::stdout().is_terminal();
     let header_style = Style::new().fg_color(Some(AnsiColor::Cyan.into())).bold();
     let profile_style = Style::new().fg_color(Some(AnsiColor::Magenta.into()));
-    let file_style = Style::new().fg_color(Some(AnsiColor::Blue.into()));
     let size_style = Style::new().fg_color(Some(AnsiColor::Green.into()));
     let dim_style = Style::new().fg_color(Some(AnsiColor::BrightBlack.into()));
 
@@ -717,21 +731,23 @@ fn print_detailed_summary(stats: &CleanupStats) {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
-
         println!(
-            "  {}. {} {} ({})",
-            i + 1,
-            paint(color, &file_info.profile, profile_style),
-            paint(color, filename, file_style),
-            paint(color, format_bytes(file_info.size), size_style)
+            "{}",
+            crate::theme::format_artifact_line(
+                i + 1,
+                &file_info.profile,
+                filename,
+                file_info.size,
+                None,
+                &crate::theme::TO_REMOVE,
+            )
         );
     }
 
     if files_sorted.len() > 10 {
         println!(
-            "  {} and {} more files...",
-            paint(color, "...", file_style),
-            files_sorted.len() - 10
+            "{}",
+            crate::theme::format_more_line(files_sorted.len() - 10, "files")
         );
     }
 }

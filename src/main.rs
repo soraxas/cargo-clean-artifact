@@ -5,6 +5,7 @@ use crate::cli::CliArgs;
 mod clean;
 mod cli;
 mod crate_deps;
+mod theme;
 mod trace_parser;
 
 #[tokio::main]
