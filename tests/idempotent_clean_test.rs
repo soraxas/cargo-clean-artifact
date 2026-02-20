@@ -295,6 +295,64 @@ fn test_stale_artifact_is_removed() {
     );
 }
 
+/// Test if cleaning requires another re-compile
+/// When the trace command itself causes recompilation (e.g. because a previous
+/// clean removed artifacts), cargo skips the fingerprint mtime log for the
+/// crates it just built in the same session.  The cleaner never sees those
+/// files in the trace and incorrectly deletes them, forcing another recompile.
+///
+/// Scenario:
+///   1. Build workspace (my_lib + main_bin).
+///   2. Delete libmy_lib's .rlib/.rmeta to force a recompile.
+///   3. Run cleaner — it traces `cargo build`, which recompiles my_lib.
+///      BUG: the freshly compiled libmy_lib.rlib is not in the mtime trace,
+///      so the cleaner deletes it.
+///   4. Next `cargo build` should be a no-op — but it isn't (it recompiles my_lib).
+#[test]
+fn test_no_recompile_after_clean_recompile() {
+    let tmp = TempDir::new().unwrap();
+    write_workspace_with_local_dep(tmp.path());
+
+    // Step 1: initial full build
+    cargo_build(tmp.path(), &["--workspace"]);
+
+    // Step 2: delete libmy_lib artifacts to force recompilation on next build
+    let deps_dir = tmp.path().join("target/debug/deps");
+    let lib_artifacts: Vec<_> = std::fs::read_dir(&deps_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with("libmy_lib")
+        })
+        .collect();
+    assert!(
+        !lib_artifacts.is_empty(),
+        "should have libmy_lib artifacts after initial build"
+    );
+    for f in &lib_artifacts {
+        std::fs::remove_file(f).unwrap();
+    }
+
+    // Step 3: run cleaner — this traces `cargo build --workspace`, which
+    // recompiles my_lib.  The freshly compiled libmy_lib.rlib is NOT logged
+    // in cargo's fingerprint mtime output (cargo skips the check for deps
+    // compiled in the same session), so the cleaner incorrectly deletes it.
+    run_clean(tmp.path(), "cargo build --workspace");
+
+    // Step 4: rebuild should find everything intact → 0 Compiling lines.
+    let rebuild = cargo_build(tmp.path(), &["--workspace"]);
+    assert_eq!(
+        compiling_count(&rebuild),
+        0,
+        "BUG: recompiled after clean (freshly compiled lib was incorrectly deleted):\n{}",
+        String::from_utf8_lossy(&rebuild.stderr)
+    );
+}
+
 /// Cleaning with a wasm target must not prevent a subsequent wasm build from
 /// finding its artifacts (no recompilation).
 #[test]
