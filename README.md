@@ -1,3 +1,7 @@
+[![CI](https://github.com/soraxas/cargo-clean-artifact/actions/workflows/ci.yml/badge.svg)](https://github.com/soraxas/cargo-clean-artifact/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/soraxas/cargo-clean-artifact/graph/badge.svg?token=Mk7JwiMg76)](https://codecov.io/gh/soraxas/cargo-clean-artifact)
+[![Release](https://github.com/soraxas/cargo-clean-artifact/actions/workflows/release.yml/badge.svg)](https://github.com/soraxas/cargo-clean-artifact/actions/workflows/release.yml)
+
 # cargo-clean-artifact
 
 Prune stale Rust build artifacts from `target/` by tracing which files are
@@ -111,7 +115,3 @@ Top files to remove:
 
 ❯ Remove 42 files (180.23 MiB)? [y/N]:
 ```
-
-## License
-
-MIT
