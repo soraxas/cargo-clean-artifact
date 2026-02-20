@@ -2,7 +2,7 @@
 authors = ["Tin Lai <tin@tinyiu.com>"]
 description = "Clean old cargo build artifacts / deps that are not used in any workspace features"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 name = "cargo-clean-artifact"
 repository = "https://github.com/soraxas/cargo-clean-artifact.git"
 version = "0.1.3"

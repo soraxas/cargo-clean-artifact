@@ -1,0 +1,226 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # Cargo env vars
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      test-code: ${{ !contains(github.event.pull_request.labels.*.name, 'test:skip') && (steps.changed.outputs.any_code_changed == 'true' || github.ref == 'refs/heads/main') }}
+      save-rust-cache: ${{ github.ref == 'refs/heads/main' || steps.changed.outputs.cache_changed == 'true' }}
+      # Run benchmarks only if Rust code changed
+      run-bench: ${{ !contains(github.event.pull_request.labels.*.name, 'test:skip') && (steps.changed.outputs.rust_code_changed == 'true' || github.ref == 'refs/heads/main') }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "Determine changed files"
+        id: changed
+        shell: bash
+        run: |
+          CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha || 'origin/main' }}...HEAD)
+
+          ANY_CODE_CHANGED=false
+          CACHE_CHANGED=false
+          RUST_CODE_CHANGED=false
+
+          while IFS= read -r file; do
+            # Check if cache-relevant files changed (Cargo files, toolchain, workflows)
+            if [[ "${file}" == "Cargo.lock" || "${file}" == "Cargo.toml" || "${file}" == "rust-toolchain.toml" || "${file}" == ".cargo/config.toml" || "${file}" =~ ^crates/.*/Cargo\.toml$ || "${file}" =~ ^\.github/workflows/.*\.yml$ ]]; then
+              echo "Detected cache-relevant change: ${file}"
+              CACHE_CHANGED=true
+            fi
+
+            # Check if Rust code changed (for benchmarks)
+            if [[ "${file}" =~ \.rs$ ]] || [[ "${file}" =~ Cargo\.toml$ ]] || [[ "${file}" == "Cargo.lock" ]] || [[ "${file}" == "rust-toolchain.toml" ]] || [[ "${file}" =~ ^\.cargo/ ]]; then
+              echo "Detected Rust code change: ${file}"
+              RUST_CODE_CHANGED=true
+            fi
+
+            if [[ "${file}" =~ ^docs/ ]]; then
+              echo "Skipping ${file} (matches docs/ pattern)"
+              continue
+            fi
+            if [[ "${file}" =~ ^mkdocs.*\.yml$ ]]; then
+              echo "Skipping ${file} (matches mkdocs*.yml pattern)"
+              continue
+            fi
+            if [[ "${file}" =~ \.md$ ]]; then
+              echo "Skipping ${file} (matches *.md pattern)"
+              continue
+            fi
+
+            echo "Detected code change in: ${file}"
+            ANY_CODE_CHANGED=true
+
+          done <<< "${CHANGED_FILES}"
+          echo "any_code_changed=${ANY_CODE_CHANGED}" >> "${GITHUB_OUTPUT}"
+          echo "cache_changed=${CACHE_CHANGED}" >> "${GITHUB_OUTPUT}"
+          echo "rust_code_changed=${RUST_CODE_CHANGED}" >> "${GITHUB_OUTPUT}"
+
+  lint:
+    name: "lint"
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: "Install Rustfmt"
+        run: rustup component add rustfmt
+      - name: "rustfmt"
+        run: cargo fmt --all --check
+      - name: Run prek checks
+        uses: j178/prek-action@564dda4cfa5e96aafdc4a5696c4bf7b46baae5ac # v1.1.0
+        env:
+          PREK_SKIP: cargo-fmt,cargo-clippy
+
+  check-release:
+    name: "check release"
+    needs: plan
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install dist
+        shell: bash
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.4/cargo-dist-installer.sh | sh"
+
+      - name: Run dist plan
+        run: |
+          dist plan --output-format=json > plan-dist-manifest.json
+          echo "dist plan completed successfully"
+          cat plan-dist-manifest.json
+
+  cargo-clippy-linux:
+    name: "cargo clippy | ubuntu"
+    needs: plan
+    if: ${{ needs.plan.outputs.test-code == 'true' }}
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          save-if: ${{ needs.plan.outputs.save-rust-cache == 'true' }}
+
+      - name: "Install Rust toolchain"
+        run: rustup component add clippy
+      - name: "Clippy"
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  # cargo-clippy-windows:
+  #   name: "cargo clippy | windows"
+  #   needs: plan
+  #   if: ${{ needs.plan.outputs.test-code == 'true' }}
+  #   timeout-minutes: 15
+  #   runs-on: windows-latest
+  #   steps:
+  #     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+  #       with:
+  #         persist-credentials: false
+  #
+  #     # - name: Create Dev Drive
+  #     #   run: ${{ github.workspace }}/.github/workflows/setup-dev-drive.ps1
+  #
+  #     # actions/checkout does not let us clone into anywhere outside ${{ github.workspace }}, so we have to copy the clone...
+  #     - name: Copy Git Repo to Dev Drive
+  #       run: |
+  #         Copy-Item -Path "${{ github.workspace }}" -Destination "$Env:PREK_WORKSPACE" -Recurse
+  #
+  #     - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+  #       with:
+  #         workspaces: ${{ env.PREK_WORKSPACE }}
+  #         save-if: ${{ needs.plan.outputs.save-rust-cache == 'true' }}
+  #
+  #     - name: "Install Rust toolchain"
+  #       run: rustup component add clippy
+  #
+  #     - name: "Clippy"
+  #       working-directory: ${{ env.PREK_WORKSPACE }}
+  #       run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  cargo-shear:
+    name: "cargo shear"
+    needs: plan
+    if: ${{ needs.plan.outputs.test-code == 'true' }}
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: "Install cargo shear"
+        uses: taiki-e/install-action@7e574ed8bb89811282a11aecb3fe1d043bf5bf0e # v2.67.15
+        with:
+          tool: cargo-shear
+      - run: cargo shear
+
+  cargo-test:
+    needs: plan
+    if: ${{ needs.plan.outputs.test-code == 'true' }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    name: "cargo test"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          save-if: ${{ needs.plan.outputs.save-rust-cache == 'true' }}
+
+      - name: "Install Rust toolchain"
+        run: rustup component add llvm-tools-preview
+
+      - name: "Install cargo nextest"
+        uses: taiki-e/install-action@7e574ed8bb89811282a11aecb3fe1d043bf5bf0e # v2.67.15
+        with:
+          tool: cargo-nextest
+
+      - name: "Install cargo-llvm-cov"
+        uses: taiki-e/install-action@7e574ed8bb89811282a11aecb3fe1d043bf5bf0e # v2.67.15
+        with:
+          tool: cargo-llvm-cov
+
+      - name: "Cargo testuv"
+        run: |
+          echo "::group::Test cargo nextest"
+          cargo llvm-cov nextest
+          echo "::endgroup::"
+
+          cargo llvm-cov report --lcov --output-path lcov.info
+
+      - name: "Upload coverage reports to Codecov"
+        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
