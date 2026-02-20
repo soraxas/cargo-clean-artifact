@@ -1,5 +1,4 @@
 use anyhow::Result;
-use clap::Parser;
 
 use crate::cli::CliArgs;
 
@@ -10,10 +9,20 @@ mod trace_parser;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Simple env_logger for debugging (only shows on RUST_LOG=debug)
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Parse args first to check verbose flag (handles cargo subcommand invocation)
+    let args = CliArgs::parse_args();
 
-    let args = CliArgs::parse();
+    // Initialize logger based on verbose flag
+    // When verbose is set, always use debug level (override RUST_LOG)
+    if args.is_verbose() {
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Debug)
+            .init();
+    } else {
+        // Otherwise respect RUST_LOG or default to warn
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    }
+
     args.run().await?;
 
     Ok(())

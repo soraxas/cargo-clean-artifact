@@ -55,6 +55,7 @@ Runs `cargo build` with trace logging for maximum accuracy.
 ### Options
 
 - `-y, --yes`: Actually remove the files (skip confirmation)
+- `-v, --verbose`: Enable verbose output (shows debug logging including target directory and exact command being run). **Note:** This overrides any RUST_LOG environment variable.
 - `--check-mode`: Use `cargo check` for tracing (fast)
 - `--build-mode`: Use `cargo build` for tracing (thorough)
 - `--command <COMMAND>`: Custom build command to trace (overrides --check-mode and --build-mode)
@@ -72,6 +73,9 @@ cargo clean-artifact --check-mode
 
 # Actually remove with current features
 cargo clean-artifact --check-mode -y
+
+# Verbose mode (shows target directory and exact command)
+cargo clean-artifact --build-mode --verbose
 
 # Thorough cleanup with all features
 cargo clean-artifact --build-mode --all-features -y

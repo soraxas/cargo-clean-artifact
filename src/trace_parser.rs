@@ -255,6 +255,9 @@ impl TraceParser {
         cmd.env("CARGO_LOG", "cargo::core::compiler::fingerprint=trace")
             .env("CARGO_TERM_COLOR", "always");
 
+        // Log the command being run
+        log::debug!("Running command: {:?}", cmd.as_std());
+
         // Capture both stdout and stderr
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

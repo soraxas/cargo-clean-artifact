@@ -73,6 +73,10 @@ pub(crate) struct CleanCommand {
     /// Comma-separated list of features to activate.
     #[clap(long = "features", value_name = "FEATURES")]
     features: Option<String>,
+
+    /// Enable verbose output (debug logging).
+    #[clap(short = 'v', long = "verbose")]
+    verbose: bool,
 }
 
 #[derive(Default)]
@@ -124,6 +128,11 @@ impl CleanupStats {
 }
 
 impl CleanCommand {
+    /// Check if verbose mode is enabled
+    pub fn is_verbose(&self) -> bool {
+        self.verbose
+    }
+
     /// Detect the profile from a custom cargo command
     fn detect_profile_from_command(command: &str) -> String {
         let parts: Vec<&str> = command.split_whitespace().collect();
@@ -153,14 +162,30 @@ impl CleanCommand {
             .current_dir(git_dir)
             .features(CargoOpt::AllFeatures)
             .exec();
-        // Not a cargo project?
-        // TODO: Log
+        
         let metadata = match metadata {
             Ok(metadata) => metadata,
-            Err(_) => return Ok(CleanupStats::default()),
+            Err(e) => {
+                eprintln!("⚠️  Warning: Not a cargo project or failed to read metadata");
+                eprintln!("   Directory: {}", git_dir.display());
+                log::debug!("Metadata error: {}", e);
+                return Ok(CleanupStats::default());
+            }
         };
 
         let target_dir = metadata.target_directory.as_std_path().to_path_buf();
+
+        log::debug!("Target directory: {}", target_dir.display());
+
+        // Check if target directory exists
+        if !target_dir.exists() {
+            eprintln!(
+                "⚠️  Warning: Target directory does not exist: {}",
+                target_dir.display()
+            );
+            eprintln!("   Run `cargo build` first to generate build artifacts.");
+            return Ok(CleanupStats::default());
+        }
 
         // Get project name and available features for feature detection
         let project_name = metadata
@@ -289,14 +314,18 @@ impl CleanCommand {
 
         // Now scan target directory and find artifacts not in the trace
         let mut stats = CleanupStats::default();
+        let mut found_any_profile = false;
 
         for profile in &profiles {
             let profile_name = if profile == "dev" { "debug" } else { profile };
             let deps_dir = target_dir.join(profile_name).join("deps");
 
             if !deps_dir.exists() {
+                log::debug!("Profile directory does not exist: {}", deps_dir.display());
                 continue;
             }
+
+            found_any_profile = true;
 
             let profile_stats = self
                 .clean_with_trace_result(&deps_dir, &trace_result.used_artifacts, profile_name)
@@ -304,6 +333,13 @@ impl CleanCommand {
                 .context(format!("Failed to clean profile: {profile_name}"))?;
 
             stats.merge_from(profile_stats);
+        }
+
+        if !found_any_profile {
+            eprintln!("⚠️  Warning: No profile directories found in target directory");
+            eprintln!("   Checked profiles: {}", profiles.join(", "));
+            eprintln!("   Target directory: {}", target_dir.display());
+            eprintln!("   Run `cargo build` first to generate build artifacts.");
         }
 
         Ok(stats)
@@ -514,12 +550,16 @@ impl CleanCommand {
             return Ok(CleanupStats::default());
         }
 
-        let dep_files = read_deps_dir(&base_dir.join("deps"))
-            .await
-            .context(format!(
-                "failed to read cargo deps at {}",
-                base_dir.display()
-            ))?;
+        let deps_dir = base_dir.join("deps");
+        if !deps_dir.exists() {
+            log::debug!("Deps directory does not exist: {}", deps_dir.display());
+            return Ok(CleanupStats::default());
+        }
+
+        let dep_files = read_deps_dir(&deps_dir).await.context(format!(
+            "failed to read cargo deps at {}",
+            base_dir.display()
+        ))?;
 
         let dry_run = self.dry_run;
 
