@@ -3,6 +3,7 @@ use std::{
     env,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use anstyle::{AnsiColor, Style};
@@ -13,6 +14,8 @@ use clap::{Args, ValueHint};
 use dialoguer::{MultiSelect, theme::ColorfulTheme};
 use futures::{future::try_join_all, try_join};
 use tokio::fs;
+
+use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::crate_deps::{DepFile, crate_key, format_bytes, paint, read_deps_dir};
 use crate::trace_parser::{TraceMode, TraceParser};
@@ -83,6 +86,8 @@ pub(crate) struct CleanCommand {
 pub(super) struct CleanupStats {
     pub(super) files: usize,
     pub(super) bytes: u64,
+    /// Total size of artifacts kept (in use)
+    pub(super) used_bytes: u64,
     pub(super) per_crate: HashMap<String, CrateStat>,
     pub(super) per_profile: HashMap<String, ProfileStat>,
     pub(super) errors: HashMap<(String, String, String), anyhow::Error>,
@@ -112,6 +117,7 @@ impl CleanupStats {
     pub(super) fn merge_from(&mut self, other: CleanupStats) {
         self.files += other.files;
         self.bytes += other.bytes;
+        self.used_bytes += other.used_bytes;
         for (name, stat) in other.per_crate {
             let entry = self.per_crate.entry(name).or_default();
             entry.files += stat.files;
@@ -300,6 +306,10 @@ impl CleanCommand {
             .unwrap_or_default()
         };
 
+        // Record time before the trace so we can exclude files created/modified during the build
+        // (e.g. the final output artifact — not a dep so not in the trace, but freshly produced).
+        let trace_start = SystemTime::now();
+
         let parser = TraceParser::new(target_dir.to_path_buf());
         let trace_result = parser
             .trace_profiles(
@@ -312,14 +322,55 @@ impl CleanCommand {
             .await
             .context("Failed to trace cargo build")?;
 
-        // Now scan target directory and find artifacts not in the trace
-        let mut stats = CleanupStats::default();
-        let mut found_any_profile = false;
+        // Compute in-use size from traced artifacts
+        let mut used_bytes = 0u64;
+        for artifact in &trace_result.used_artifacts {
+            if let Ok(meta) = tokio::fs::metadata(artifact).await {
+                used_bytes += meta.len();
+            }
+        }
 
+        // Derive all deps/ directories to scan from the trace result paths.
+        // This automatically handles cross-compilation targets like
+        // target/wasm32-unknown-unknown/wasm-dev/deps/.
+        let mut scan_dirs: Vec<(PathBuf, String)> = Vec::new(); // (path, display_profile)
+        for artifact in &trace_result.used_artifacts {
+            if let Some(parent) = artifact.parent() {
+                if parent.file_name().map_or(false, |n| n == "deps")
+                    && parent.starts_with(target_dir)
+                    && !scan_dirs.iter().any(|(d, _)| d == parent)
+                {
+                    // Display name: strip target_dir prefix and trailing "/deps"
+                    let display = parent
+                        .strip_prefix(target_dir)
+                        .ok()
+                        .and_then(|p| p.parent()) // drop "deps" component
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    scan_dirs.push((parent.to_path_buf(), display));
+                }
+            }
+        }
+
+        // Also add explicitly requested profile dirs (in case nothing was traced there yet)
         for profile in &profiles {
             let profile_name = if profile == "dev" { "debug" } else { profile };
             let deps_dir = target_dir.join(profile_name).join("deps");
+            if deps_dir.exists() && !scan_dirs.iter().any(|(d, _)| d == &deps_dir) {
+                scan_dirs.push((deps_dir, profile_name.to_string()));
+            }
+        }
 
+        log::debug!("Scanning {} deps directories", scan_dirs.len());
+        for (dir, name) in &scan_dirs {
+            log::debug!("  {} ({})", name, dir.display());
+        }
+
+        // Now scan target directory and find artifacts not in the trace
+        let mut stats = CleanupStats { used_bytes, ..Default::default() };
+        let mut found_any_profile = false;
+
+        for (deps_dir, display_profile) in &scan_dirs {
             if !deps_dir.exists() {
                 log::debug!("Profile directory does not exist: {}", deps_dir.display());
                 continue;
@@ -328,9 +379,9 @@ impl CleanCommand {
             found_any_profile = true;
 
             let profile_stats = self
-                .clean_with_trace_result(&deps_dir, &trace_result.used_artifacts, profile_name)
+                .clean_with_trace_result(deps_dir, &trace_result.used_artifacts, display_profile, trace_start)
                 .await
-                .context(format!("Failed to clean profile: {profile_name}"))?;
+                .context(format!("Failed to clean profile: {display_profile}"))?;
 
             stats.merge_from(profile_stats);
         }
@@ -345,84 +396,110 @@ impl CleanCommand {
         Ok(stats)
     }
 
-    /// Clean artifacts in a deps directory based on trace results
+    /// Clean artifacts in a deps directory based on trace results.
+    /// Uses stem-based grouping: all files sharing a `crate-HASH` stem with a
+    /// used `.rlib`/`.rmeta` are kept. This catches `.dwo`, `.o`, `.d`, etc.
     async fn clean_with_trace_result(
         &self,
         deps_dir: &Path,
         used_artifacts: &std::collections::HashSet<PathBuf>,
         profile: &str,
+        trace_start: SystemTime,
     ) -> Result<CleanupStats> {
+        // Build the set of used stems from artifacts that live in this deps dir
+        let mut used_stems: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for artifact in used_artifacts {
+            if artifact.parent() == Some(deps_dir) {
+                if let Some(stem) = artifact_stem(artifact) {
+                    used_stems.insert(stem);
+                }
+            }
+        }
+
         let mut stats = CleanupStats::default();
         let mut entries = fs::read_dir(deps_dir).await?;
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-
-            // Only process .rlib and .rmeta files
-            if let Some(ext) = path.extension() {
-                if ext != "rlib" && ext != "rmeta" {
-                    continue;
-                }
-            } else {
+            if path.is_dir() {
                 continue;
             }
 
-            // Check if this artifact was used
-            if used_artifacts.contains(&path) {
+            // Derive stem; skip files with no recognisable artifact stem
+            let stem = match artifact_stem(&path) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Any file sharing a stem with a used artifact is kept
+            if used_stems.contains(&stem) {
                 continue;
             }
 
-            // IMPORTANT: If this is a .rmeta file, check if the corresponding .rlib is used
-            // We need to keep .rmeta files if their .rlib is being used
-            if path.extension().and_then(|e| e.to_str()) == Some("rmeta") {
-                // Convert libfoo-hash.rmeta to libfoo-hash.rlib
-                let rlib_path = path.with_extension("rlib");
-                if used_artifacts.contains(&rlib_path) {
-                    // The .rlib is used, so keep the .rmeta too
+            // Skip files that were created/modified during (or after) the trace run —
+            // they are the freshly-produced output artifacts, not stale leftovers.
+            let meta = fs::metadata(&path).await;
+            if let Ok(ref m) = meta {
+                if m.modified().map_or(false, |mtime| mtime >= trace_start) {
                     continue;
                 }
             }
 
-            // Similarly, if this is a .rlib file, check if the corresponding .rmeta is used
-            // If .rmeta is explicitly used, we likely need the .rlib too
-            if path.extension().and_then(|e| e.to_str()) == Some("rlib") {
-                let rmeta_path = path.with_extension("rmeta");
-                if used_artifacts.contains(&rmeta_path) {
-                    // The .rmeta is used, so keep the .rlib too
-                    continue;
-                }
-            }
-
-            // This artifact is unused!
-            let size = fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+            // Unused – mark for removal
+            let size = meta.map(|m| m.len()).unwrap_or(0);
             let crate_key = crate_key(&path);
 
-            // Track this file for removal
             stats.files_to_remove.push(FileToRemove {
                 path: path.clone(),
                 size,
                 profile: profile.to_string(),
             });
-
-            fn update_stats(stats: &mut CleanupStats, crate_key: &str, size: u64, profile: &str) {
-                stats.files += 1;
-                stats.bytes += size;
-                let entry = stats.per_crate.entry(crate_key.to_string()).or_default();
-                entry.files += 1;
-                entry.bytes += size;
-                let profile_entry = stats.per_profile.entry(profile.to_string()).or_default();
-                profile_entry.files += 1;
-                profile_entry.bytes += size;
-            }
-
-            update_stats(&mut stats, &crate_key, size, profile);
+            stats.files += 1;
+            stats.bytes += size;
+            let entry = stats.per_crate.entry(crate_key).or_default();
+            entry.files += 1;
+            entry.bytes += size;
+            let profile_entry = stats.per_profile.entry(profile.to_string()).or_default();
+            profile_entry.files += 1;
+            profile_entry.bytes += size;
         }
 
         Ok(stats)
     }
+} // end impl CleanCommand (first block)
 
+/// Extract the `crate_name-HASH` stem from any artifact file:
+/// - `libfoo-HASH.rlib`              → `foo-HASH`
+/// - `libfoo-HASH.rmeta`             → `foo-HASH`
+/// - `foo-HASH.d`                    → `foo-HASH`
+/// - `foo-HASH.foo.cgu.00.rcgu.dwo`  → `foo-HASH`
+/// - `foo-HASH.foo.cgu.00.rcgu.o`    → `foo-HASH`
+fn artifact_stem(path: &Path) -> Option<String> {
+    let filename = path.file_name()?.to_str()?;
+    // Strip "lib" prefix (rlib/rmeta files carry it, dwo/o/d don't)
+    let without_lib = filename.strip_prefix("lib").unwrap_or(filename);
+    // Take everything before the first dot
+    let stem = without_lib.split_once('.').map_or(without_lib, |(s, _)| s);
+    // Must contain '-' (crate name / hash separator) to be a valid artifact
+    if stem.contains('-') {
+        Some(stem.to_string())
+    } else {
+        None
+    }
+}
+
+impl CleanCommand {
     async fn actually_remove_files(&self, stats: &CleanupStats) -> Result<CleanupStats> {
         let mut removal_stats = CleanupStats::default();
+
+        let pb = ProgressBar::new(stats.files as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} files ({bytes_per_sec}) {msg}")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        pb.set_message("Removing...");
 
         for file_info in &stats.files_to_remove {
             let crate_key = crate_key(&file_info.path);
@@ -454,7 +531,10 @@ impl CleanCommand {
                     );
                 }
             }
+            pb.inc(1);
         }
+
+        pb.finish_and_clear();
 
         Ok(removal_stats)
     }
@@ -754,10 +834,11 @@ fn print_detailed_summary(stats: &CleanupStats) {
     let profile_style = Style::new().fg_color(Some(AnsiColor::Magenta.into()));
     let file_style = Style::new().fg_color(Some(AnsiColor::Blue.into()));
     let size_style = Style::new().fg_color(Some(AnsiColor::Green.into()));
+    let dim_style = Style::new().fg_color(Some(AnsiColor::BrightBlack.into()));
 
     println!();
     println!(
-        "{} {}",
+        "{} {}{}",
         paint(color, "📊 Summary:", header_style),
         paint(
             color,
@@ -767,7 +848,16 @@ fn print_detailed_summary(stats: &CleanupStats) {
                 format_bytes(stats.bytes)
             ),
             size_style
-        )
+        ),
+        if stats.used_bytes > 0 {
+            paint(
+                color,
+                format!("  •  {} in use", format_bytes(stats.used_bytes)),
+                dim_style,
+            )
+        } else {
+            String::new()
+        }
     );
     println!();
 
