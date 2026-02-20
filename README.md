@@ -1,6 +1,12 @@
 # cargo-clean-artifact
 
-Clean old cargo build artifacts and dependencies that are no longer used by any workspace features.
+Prune stale Rust build artifacts from `target/` by tracing which files are
+actually referenced during a build — not guessing.
+
+Run your build command once; `cargo-clean-artifact` captures the artifact
+paths cargo logs, removes everything in `target/{profile}/deps/` that was
+**not** referenced, and leaves everything that was needed intact so the next
+build requires zero recompilation.
 
 ## Installation
 
@@ -11,136 +17,100 @@ cargo install cargo-clean-artifact
 ## Usage
 
 ```sh
-cargo clean-artifact [OPTIONS]
+cargo clean-artifact -c <BUILD_COMMAND> [OPTIONS]
 ```
 
-### Cleaning Modes
+`-c` / `--command` is **required**. Supply whatever command you normally use
+to build your project. It is executed via `sh -c`, so shell quoting, pipes,
+and spaces in arguments all work normally.
 
-**1. Default Mode (Fast, ~50-60% accurate)**
+```sh
+# Standard debug build
+cargo clean-artifact -c "cargo build"
 
-```bash
-cargo clean-artifact
+# Release profile
+cargo clean-artifact -c "cargo build --release"
+
+# Specific features / target
+cargo clean-artifact -c "cargo build --features serde --target wasm32-unknown-unknown"
+
+# trunk (WASM bundler)
+cargo clean-artifact -c "trunk build"
+
+# mise task
+cargo clean-artifact -c "mise run wasm-dev-build"
+
+# Skip the confirmation prompt and remove immediately
+cargo clean-artifact -c "cargo build" -y
+
+# Verbose: show debug log (target dir, exact command, etc.)
+cargo clean-artifact -c "cargo build" -v
 ```
-
-Uses `.d` dependency files to detect unused artifacts. Fastest but may miss some stray files.
-
-**2. Check Mode (Recommended, ~80-90% accurate)**
-
-```bash
-cargo clean-artifact --check-mode
-```
-
-Runs `cargo check` with trace logging to see which artifacts are actually used.
-
-- Faster than build mode (~10-20 seconds)
-- More accurate than default mode
-- May miss some `.rlib` files that are only needed during full builds
-- By default uses current feature configuration (auto-detected)
-- **Shows cargo compilation progress in real-time**
-
-**3. Build Mode (Most thorough, ~95-99% accurate)**
-
-```bash
-cargo clean-artifact --build-mode
-```
-
-Runs `cargo build` with trace logging for maximum accuracy.
-
-- Takes longer (~30-60 seconds)
-- Most complete detection of unused artifacts
-- Recommended for thorough cleanup
-- By default uses current feature configuration (auto-detected)
-- **Shows cargo compilation progress in real-time**
 
 ### Options
 
-- `-y, --yes`: Actually remove the files (skip confirmation)
-- `-v, --verbose`: Enable verbose output (shows debug logging including target directory and exact command being run). **Note:** This overrides any RUST_LOG environment variable.
-- `--check-mode`: Use `cargo check` for tracing (fast)
-- `--build-mode`: Use `cargo build` for tracing (thorough)
-- `--command <COMMAND>`: Custom build command to trace (overrides --check-mode and --build-mode)
-- `--profile <PROFILE>`: Specify build profile(s) to check. Can be used multiple times. If not specified, shows an interactive selector of available profiles.
-- `--all-features`: Enable all features when tracing
-- `--no-default-features`: Disable default features when tracing
-- `--features <FEATURES>`: Comma-separated list of features to enable when tracing
-- `--allow-shared-target-dir`: Allow cleaning when CARGO_TARGET_DIR is set (use with caution)
+| Flag | Description |
+|------|-------------|
+| `-c, --command <CMD>` | Build command to trace (**required**) |
+| `-y, --yes` | Remove files without confirmation |
+| `--dry-run` | Preview what would be removed (default) |
+| `-v, --verbose` | Debug logging (target dir, command, …) |
+| `--allow-shared-target-dir` | Allow cleaning a shared/global `CARGO_TARGET_DIR` |
+| `[DIR]` | Directory to clean (default: `.`) |
 
-### Examples
+## How It Works
 
-```bash
-# Interactive profile selection (default when no --profile specified)
-cargo clean-artifact --check-mode
+1. **Trace**: Runs your build command with
+   `CARGO_LOG=cargo::core::compiler::fingerprint=trace` and captures every
+   artifact path that cargo's fingerprint engine references (`.rlib`,
+   `.rmeta`, `.so`, `.dylib`, `.dll`, …).
 
-# Actually remove with current features
-cargo clean-artifact --check-mode -y
+2. **Scan**: Collects all files in the `deps/` directories that appeared in
+   the trace (e.g. `target/debug/deps/`, `target/wasm32-unknown-unknown/wasm-dev/deps/`).
+   Files outside those directories are never touched.
 
-# Verbose mode (shows target directory and exact command)
-cargo clean-artifact --build-mode --verbose
+3. **Protect output artifacts**: Files sitting directly in `target/{profile}/`
+   (the final linked binary, `.rlib`, `.wasm`, etc.) are never removed, even
+   if they didn't appear in the trace.
 
-# Thorough cleanup with all features
-cargo clean-artifact --build-mode --all-features -y
+4. **Remove**: Everything in the scanned `deps/` directories that was **not**
+   referenced is deleted. Only profiles/targets that appeared in your build
+   are touched — a wasm build will never clean your native `debug/` artifacts.
 
-# Clean specific features only
-cargo clean-artifact --build-mode --features "serde,logging" -y
+### Profile / target isolation
 
-# Clean specific profiles (skips interactive selector)
-cargo clean-artifact --build-mode --profile debug --profile release -y
+The tool only cleans directories it actually observed in the trace. If you
+run `cargo clean-artifact -c "trunk build"` it will only scan the wasm
+profile's `deps/` folder, leaving `target/debug/` completely untouched.
 
-# Custom build command (full control)
-cargo clean-artifact --command "cargo build --release --target x86_64-unknown-linux-gnu" --profile release -y
+### Idempotency
 
-# Cross-compilation cleanup
-cargo clean-artifact --command "cargo build --target aarch64-unknown-linux-gnu" --profile debug -y
-```
+Running the tool twice in a row is safe: the second run will report
+"No unused artifacts found" and the subsequent build will not recompile
+anything.
 
-#### How It Works
-
-If you run `ddt clean .` from a cargo project using git:
-
-### How It Works
-
-**Default mode**: Uses `.d` dependency files. If an artifact for a specific version exists but it's not in the dependency graph anymore, it will be removed. Currently only removes large files like `.rlib` and `.rmeta`.
-
-**Trace modes** (recommended): Runs cargo with `CARGO_LOG=cargo::core::compiler::fingerprint=trace` to capture exactly which artifacts are referenced during the build process:
-
-- **Check mode**: Uses `cargo check` (~4s, fast, ~90% accurate)
-- **Build mode**: Uses `cargo build` (~30s, thorough, ~99% accurate)
-
-Both trace modes properly handle:
-
-- `.rlib` and `.rmeta` file pairing (keeps both if either is used to prevent recompilation)
-- Multiple build profiles (debug, release, custom)
-- Feature-specific dependencies via `--features`, `--all-features`, `--no-default-features`
-- Cross-crate dependencies
-
-**Feature detection**: By default, the tool **auto-detects** which features were used in previous builds by parsing fingerprint files in `target/{profile}/.fingerprint/`. It then **validates** these against your current `Cargo.toml` to filter out any outdated features. This ensures the trace uses the same features you've been building with, making it faster and more accurate than `--all-features`.
-
-Example output:
+## Example Output
 
 ```text
-🔎 Auto-detected features: rayon, p3p, kornia-pnp
-⚠️  Ignoring outdated features: tracing-subscriber, old-feature
-🔍 Tracing dependencies using cargo Build with features: rayon,p3p,kornia-pnp...
+🔍 Tracing with custom command: cargo build --release...
+   Compiling serde v1.0.219
+   Compiling my-crate v0.3.0 (...)
+    Finished `release` profile [optimized] target(s) in 12.34s
+────────────────────────────────────────────────────────────────
+✅ Traced 247 artifacts in use  (312.50 MiB)
+
+📊 Summary: 42 files (180.23 MiB) can be removed  •  312.50 MiB in use
+
+By profile:
+  release: 42 files (180.23 MiB)
+
+Top files to remove:
+  1. release libserde-old1234abcd.rlib (45.10 MiB)
+  2. release libsyn-old5678efgh.rlib  (38.70 MiB)
+  ...
+
+❯ Remove 42 files (180.23 MiB)? [y/N]:
 ```
-
-If you want to override auto-detection:
-
-- `--all-features`: Check all possible features (thorough but slower)
-- `--features "a,b,c"`: Check specific features only
-- `--no-default-features`: Check without default features
-
-**Profile detection**: When no `--profile` is specified in trace modes, the tool scans your target/ directory and shows an interactive selector for available profiles (debug, release, custom, etc.). You can select multiple profiles using Space and confirm with Enter.
-
-## Features
-
-- **Trace-based cleaning**: Most accurate artifact detection using cargo's own build trace
-- **Real-time progress**: See what's being compiled during trace mode
-- **Smart feature auto-detection**: Parses fingerprint files to detect which features were used in previous builds
-- **Interactive profile selection**: Automatically detect and let you choose which profiles to clean
-- **Custom build commands**: Full control with `--command` flag for complex build scenarios
-- **Feature-aware**: Supports `--all-features`, `--no-default-features`, and `--features`
-- **Safe**: Uses `.rlib`/`.rmeta` pairing to prevent false positives and unnecessary recompilation
-- **Beautiful output**: Shows top 10 largest files, per-profile breakdowns, and clear summaries
 
 ## License
 
