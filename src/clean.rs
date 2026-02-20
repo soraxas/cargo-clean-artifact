@@ -352,12 +352,17 @@ impl CleanCommand {
             }
         }
 
-        // Also add explicitly requested profile dirs (in case nothing was traced there yet)
-        for profile in &profiles {
-            let profile_name = if profile == "dev" { "debug" } else { profile };
-            let deps_dir = target_dir.join(profile_name).join("deps");
-            if deps_dir.exists() && !scan_dirs.iter().any(|(d, _)| d == &deps_dir) {
-                scan_dirs.push((deps_dir, profile_name.to_string()));
+        // Also add explicitly requested profile dirs (in case nothing was traced there yet).
+        // Only do this for built-in modes (check/build), not custom commands — a custom command
+        // may build for a different target entirely (e.g. wasm) and should only clean what it
+        // actually traced.
+        if self.custom_command.is_none() {
+            for profile in &profiles {
+                let profile_name = if profile == "dev" { "debug" } else { profile };
+                let deps_dir = target_dir.join(profile_name).join("deps");
+                if deps_dir.exists() && !scan_dirs.iter().any(|(d, _)| d == &deps_dir) {
+                    scan_dirs.push((deps_dir, profile_name.to_string()));
+                }
             }
         }
 

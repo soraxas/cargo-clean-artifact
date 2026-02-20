@@ -6,6 +6,8 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+use crate::crate_deps::format_bytes;
+
 /// Mode for tracing cargo builds
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceMode {
@@ -273,49 +275,52 @@ impl TraceParser {
         let mut stdout_reader = BufReader::new(stdout).lines();
         let mut stderr_reader = BufReader::new(stderr).lines();
 
-        // Create progress spinner
+        // Powerline-style spinner: blue-bg label  artifact count + size
         let spinner = ProgressBar::new_spinner();
         spinner.set_style(
             ProgressStyle::default_spinner()
                 .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
-                .template("{spinner:.cyan} {msg}")
+                // left segment: bold bright-white on blue  │  right: cyan stats
+                .template(concat!(
+                    "\x1b[44;1;97m {spinner} Tracing \x1b[0;34m\u{e0b0}\x1b[0;36m  {msg}  \x1b[0m"
+                ))
                 .unwrap(),
         );
-        spinner.set_message("Tracing dependencies... (0 artifacts found)");
-        spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+        spinner.set_message("scanning…");
+        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+
+        let mut total_size: u64 = 0;
 
         // Read both streams concurrently
-        let mut cur_status_line = None;
         loop {
             tokio::select! {
-                // Discard stdout (cargo's compilation progress)
+                // Consume stdout (some commands write progress to stdout)
                 stdout_line = stdout_reader.next_line() => {
                     match stdout_line? {
-                        Some(line) => {
-                            // Silently consume stdout
-                            spinner.set_message(line);
-                        }
-                        None => {
-                            // stdout closed
-                        }
+                        Some(line) => { spinner.println(&line); }
+                        None => {}
                     }
                 }
-                // Parse stderr for trace logs
+                // Parse stderr for trace logs and cargo output
                 stderr_line = stderr_reader.next_line() => {
                     match stderr_line? {
                         Some(line) => {
                             if let Some(path) = self.extract_artifact_path(&line) {
-                                // has artifact path
-                                result.used_artifacts.insert(path);
-                            } else if !line.contains("cargo::core::compiler::fingerprint:") && !line.trim().is_empty(){
-                                // this not a log line. store for display
-                                cur_status_line = Some(line);
+                                // New artifact: stat it for live size tracking
+                                if result.used_artifacts.insert(path.clone()) {
+                                    if let Ok(meta) = std::fs::metadata(&path) {
+                                        total_size += meta.len();
+                                    }
+                                    spinner.set_message(format!(
+                                        "{} artifacts  •  {}",
+                                        result.used_artifacts.len(),
+                                        format_bytes(total_size),
+                                    ));
+                                }
+                            } else if !line.contains("cargo::core::compiler::fingerprint:") && !line.trim().is_empty() {
+                                // Normal cargo output (Compiling, Finished, etc.) — print above spinner
+                                spinner.println(&line);
                             }
-                            spinner.set_message(format!(
-                                "Tracing dependencies... ({} artifacts found)\n{}",
-                                result.used_artifacts.len(),
-                                &cur_status_line.as_ref().unwrap_or(&"".to_string())
-                            ));
                         }
                         None => {
                             // stderr closed, we're done
@@ -329,11 +334,13 @@ impl TraceParser {
         // Wait for command to complete
         let status = child.wait().await?;
 
-        spinner.finish_with_message(format!(
-            "✅ Trace complete: found {} artifacts in use",
-            result.used_artifacts.len()
-        ));
-        println!(); // Blank line after spinner
+        spinner.finish_and_clear();
+        println!(
+            "✅ Traced \x1b[1;36m{}\x1b[0m artifacts in use  \x1b[2m({})\x1b[0m",
+            result.used_artifacts.len(),
+            format_bytes(total_size),
+        );
+        println!();
 
         if !status.success() {
             anyhow::bail!("Cargo command failed with status: {status}");
