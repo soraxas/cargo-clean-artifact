@@ -151,6 +151,7 @@ dependencies = [
  "assert_fs",
  "cargo_metadata",
  "clap",
+ "console",
  "dialoguer",
  "env_logger",
  "fs-err",

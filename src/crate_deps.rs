@@ -1,46 +1,5 @@
 use anstyle::{Reset, Style};
-use anyhow::Result;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use tokio::fs;
-
-#[derive(Debug)]
-pub(crate) struct DepFile {
-    pub(crate) map: HashMap<PathBuf, Vec<PathBuf>>,
-}
-
-pub(crate) async fn read_deps_dir(dir: &Path) -> Result<Vec<DepFile>> {
-    let mut entries = fs::read_dir(dir).await?;
-    let mut files = vec![];
-
-    while let Some(e) = entries.next_entry().await? {
-        let path = e.path();
-        if path.extension().is_some_and(|ext| ext == "d") {
-            let content = fs::read_to_string(&path).await?;
-            let file = parse_dep_file(&content)?;
-            files.push(file);
-        }
-    }
-
-    Ok(files)
-}
-
-pub(crate) fn parse_dep_file(s: &str) -> Result<DepFile> {
-    let entries = s
-        .lines()
-        .map(|s| s.trim())
-        .filter(|&s| !s.is_empty())
-        .map(|line| line.split_once(':').unwrap())
-        .map(|(k, v)| {
-            (
-                PathBuf::from(k),
-                v.split_whitespace().map(PathBuf::from).collect(),
-            )
-        })
-        .collect();
-
-    Ok(DepFile { map: entries })
-}
+use std::path::Path;
 
 pub(crate) fn paint(enabled: bool, text: impl AsRef<str>, style: Style) -> String {
     if !enabled {

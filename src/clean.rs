@@ -3,22 +3,20 @@ use std::{
     env,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 
 use anstyle::{AnsiColor, Style};
 use anyhow::{Context, Result};
-use cargo_metadata::{CargoOpt, MetadataCommand};
+use cargo_metadata::MetadataCommand;
 use clap::ArgAction;
 use clap::{Args, ValueHint};
-use dialoguer::{MultiSelect, theme::ColorfulTheme};
-use futures::{future::try_join_all, try_join};
+use futures::future::try_join_all;
 use tokio::fs;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::crate_deps::{DepFile, crate_key, format_bytes, paint, read_deps_dir};
-use crate::trace_parser::{TraceMode, TraceParser};
+use crate::crate_deps::{crate_key, format_bytes, paint};
+use crate::trace_parser::TraceParser;
 
 /// Clean unused, old project files.
 ///
@@ -48,34 +46,10 @@ pub(crate) struct CleanCommand {
     #[clap(long, action = ArgAction::SetTrue)]
     allow_shared_target_dir: bool,
 
-    /// Use cargo check trace mode (light, faster but may miss some artifacts).
-    #[clap(long = "check-mode", conflicts_with = "build_mode")]
-    check_mode: bool,
-
-    /// Use cargo build trace mode (full, slower but more complete).
-    #[clap(long = "build-mode", conflicts_with = "check_mode")]
-    build_mode: bool,
-
-    /// Custom build command to trace (e.g. "cargo build --release --target x86_64-unknown-linux-gnu").
-    /// If specified, this overrides --check-mode and --build-mode.
-    #[clap(long = "command", value_name = "COMMAND", conflicts_with_all = &["check_mode", "build_mode"])]
+    /// Build command to trace (e.g. "cargo build --release --target wasm32-unknown-unknown").
+    /// Passed to `sh -c`, so quoting and spaces work as normal.
+    #[clap(short = 'c', long = "command", value_name = "COMMAND")]
     custom_command: Option<String>,
-
-    /// Profiles to check (default: debug). Can be specified multiple times.
-    #[clap(long = "profile", value_name = "PROFILE")]
-    profiles: Vec<String>,
-
-    /// Build with all features enabled (thorough but may be slower).
-    #[clap(long = "all-features")]
-    all_features: bool,
-
-    /// Build with no default features.
-    #[clap(long = "no-default-features")]
-    no_default_features: bool,
-
-    /// Comma-separated list of features to activate.
-    #[clap(long = "features", value_name = "FEATURES")]
-    features: Option<String>,
 
     /// Enable verbose output (debug logging).
     #[clap(short = 'v', long = "verbose")]
@@ -139,24 +113,6 @@ impl CleanCommand {
         self.verbose
     }
 
-    /// Detect the profile from a custom cargo command
-    fn detect_profile_from_command(command: &str) -> String {
-        let parts: Vec<&str> = command.split_whitespace().collect();
-
-        // Look for --profile <name> or --release
-        for i in 0..parts.len() {
-            if parts[i] == "--release" {
-                return "release".to_string();
-            }
-            if parts[i] == "--profile" && i + 1 < parts.len() {
-                return parts[i + 1].to_string();
-            }
-        }
-
-        // Default to debug
-        "debug".to_string()
-    }
-
     /// Clean up `target` of cargo.
     ///
     /// We only remove build outputs for outdated dependencies.
@@ -164,11 +120,12 @@ impl CleanCommand {
         &self,
         git_dir: &Path,
     ) -> Result<CleanupStats> {
+        let cmd = self.custom_command.as_deref().expect("command required");
+
         let metadata = MetadataCommand::new()
             .current_dir(git_dir)
-            .features(CargoOpt::AllFeatures)
             .exec();
-        
+
         let metadata = match metadata {
             Ok(metadata) => metadata,
             Err(e) => {
@@ -180,78 +137,19 @@ impl CleanCommand {
         };
 
         let target_dir = metadata.target_directory.as_std_path().to_path_buf();
-
         log::debug!("Target directory: {}", target_dir.display());
 
-        // Check if target directory exists
         if !target_dir.exists() {
             eprintln!(
                 "⚠️  Warning: Target directory does not exist: {}",
                 target_dir.display()
             );
-            eprintln!("   Run `cargo build` first to generate build artifacts.");
+            eprintln!("   Run your build command first to generate build artifacts.");
             return Ok(CleanupStats::default());
         }
 
-        // Get project name and available features for feature detection
-        let project_name = metadata
-            .workspace_root
-            .as_std_path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-
-        // Get list of available features from the root package
-        let available_features: Vec<String> = metadata
-            .packages
-            .iter()
-            .find(|pkg| pkg.name == project_name)
-            .map(|pkg| pkg.features.keys().cloned().collect())
-            .unwrap_or_default();
-
-        // Use trace mode if requested
-        if self.check_mode || self.build_mode || self.custom_command.is_some() {
-            return self
-                .remove_unused_files_with_trace(
-                    git_dir,
-                    &target_dir,
-                    project_name,
-                    &available_features,
-                )
-                .await;
-        }
-
-        // Otherwise use the legacy .d file method
-        let used_package_dirs = metadata
-            .packages
-            .iter()
-            .map(|pkg| {
-                pkg.manifest_path
-                    .parent()
-                    .unwrap()
-                    .as_std_path()
-                    .to_path_buf()
-            })
-            .collect::<Vec<_>>();
-
-        let (debug, release) = try_join!(
-            async {
-                self.clean_one_target(&used_package_dirs, &target_dir, "debug")
-                    .await
-                    .context("failed to clean debug target")
-            },
-            async {
-                self.clean_one_target(&used_package_dirs, &target_dir, "release")
-                    .await
-                    .context("failed to clean release target")
-            },
-        )?;
-
-        let mut total = CleanupStats::default();
-        total.merge_from(debug);
-        total.merge_from(release);
-
-        Ok(total)
+        self.remove_unused_files_with_trace(git_dir, &target_dir, cmd)
+            .await
     }
 
     /// Remove unused files using cargo trace mode
@@ -259,68 +157,13 @@ impl CleanCommand {
         &self,
         project_dir: &Path,
         target_dir: &Path,
-        project_name: &str,
-        available_features: &[String],
+        cmd: &str,
     ) -> Result<CleanupStats> {
-        let mode = if self.check_mode {
-            TraceMode::Check
-        } else {
-            TraceMode::Build
-        };
-
-        // Detect profiles from custom command or use specified profiles
-        let profiles = if let Some(ref cmd) = self.custom_command {
-            // Parse profile from custom command
-            vec![Self::detect_profile_from_command(cmd)]
-        } else if self.profiles.is_empty() {
-            vec!["debug".to_string()]
-        } else {
-            self.profiles.clone()
-        };
-
-        // Build feature configuration - auto-detect if no flags specified and no custom command
-        let feature_config = if self.custom_command.is_some() {
-            // Custom command - don't add feature flags automatically
-            crate::trace_parser::FeatureConfig::default()
-        } else if self.all_features || self.no_default_features || self.features.is_some() {
-            // User explicitly specified features
-            crate::trace_parser::FeatureConfig {
-                all_features: self.all_features,
-                no_default_features: self.no_default_features,
-                features: self.features.clone(),
-            }
-        } else {
-            // Auto-detect from fingerprints, validating against available features
-            let profile_name = if profiles[0] == "dev" {
-                "debug"
-            } else {
-                &profiles[0]
-            };
-            crate::trace_parser::FeatureConfig::auto_detect_from_fingerprints(
-                target_dir,
-                profile_name,
-                project_name,
-                available_features,
-            )
-            .await
-            .unwrap_or_default()
-        };
-
-        // Record time before the trace so we can exclude files created/modified during the build
-        // (e.g. the final output artifact — not a dep so not in the trace, but freshly produced).
-        let trace_start = SystemTime::now();
-
         let parser = TraceParser::new(target_dir.to_path_buf());
         let trace_result = parser
-            .trace_profiles(
-                project_dir,
-                mode,
-                &profiles,
-                &feature_config,
-                self.custom_command.as_deref(),
-            )
+            .trace(project_dir, cmd)
             .await
-            .context("Failed to trace cargo build")?;
+            .context("Failed to trace build command")?;
 
         // Compute in-use size from traced artifacts
         let mut used_bytes = 0u64;
@@ -352,26 +195,11 @@ impl CleanCommand {
             }
         }
 
-        // Also add explicitly requested profile dirs (in case nothing was traced there yet).
-        // Only do this for built-in modes (check/build), not custom commands — a custom command
-        // may build for a different target entirely (e.g. wasm) and should only clean what it
-        // actually traced.
-        if self.custom_command.is_none() {
-            for profile in &profiles {
-                let profile_name = if profile == "dev" { "debug" } else { profile };
-                let deps_dir = target_dir.join(profile_name).join("deps");
-                if deps_dir.exists() && !scan_dirs.iter().any(|(d, _)| d == &deps_dir) {
-                    scan_dirs.push((deps_dir, profile_name.to_string()));
-                }
-            }
-        }
-
         log::debug!("Scanning {} deps directories", scan_dirs.len());
         for (dir, name) in &scan_dirs {
             log::debug!("  {} ({})", name, dir.display());
         }
 
-        // Now scan target directory and find artifacts not in the trace
         let mut stats = CleanupStats { used_bytes, ..Default::default() };
         let mut found_any_profile = false;
 
@@ -384,7 +212,7 @@ impl CleanCommand {
             found_any_profile = true;
 
             let profile_stats = self
-                .clean_with_trace_result(deps_dir, &trace_result.used_artifacts, display_profile, trace_start)
+                .clean_with_trace_result(deps_dir, &trace_result.used_artifacts, display_profile)
                 .await
                 .context(format!("Failed to clean profile: {display_profile}"))?;
 
@@ -392,10 +220,9 @@ impl CleanCommand {
         }
 
         if !found_any_profile {
-            eprintln!("⚠️  Warning: No profile directories found in target directory");
-            eprintln!("   Checked profiles: {}", profiles.join(", "));
+            eprintln!("⚠️  Warning: No traced artifact directories found.");
+            eprintln!("   Make sure your build command produces output in the cargo target directory.");
             eprintln!("   Target directory: {}", target_dir.display());
-            eprintln!("   Run `cargo build` first to generate build artifacts.");
         }
 
         Ok(stats)
@@ -404,12 +231,14 @@ impl CleanCommand {
     /// Clean artifacts in a deps directory based on trace results.
     /// Uses stem-based grouping: all files sharing a `crate-HASH` stem with a
     /// used `.rlib`/`.rmeta` are kept. This catches `.dwo`, `.o`, `.d`, etc.
+    ///
+    /// Additionally protects files whose crate name matches a current build output
+    /// in the parent profile directory (the final binary / library / wasm).
     async fn clean_with_trace_result(
         &self,
         deps_dir: &Path,
         used_artifacts: &std::collections::HashSet<PathBuf>,
         profile: &str,
-        trace_start: SystemTime,
     ) -> Result<CleanupStats> {
         // Build the set of used stems from artifacts that live in this deps dir
         let mut used_stems: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -419,6 +248,32 @@ impl CleanCommand {
                     used_stems.insert(stem);
                 }
             }
+        }
+
+        // Build a set of current output crate names from files directly in the
+        // parent profile directory (e.g. target/release/).  Files there are the
+        // final build outputs — keep their corresponding deps/ intermediates.
+        let mut protected_crate_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if let Some(profile_dir) = deps_dir.parent() {
+            if let Ok(mut profile_entries) = fs::read_dir(profile_dir).await {
+                while let Some(pe) = profile_entries.next_entry().await.ok().flatten() {
+                    let p = pe.path();
+                    if p.is_file() {
+                        if let Some(name) = p.file_stem().and_then(|s| s.to_str()) {
+                            let name = name.strip_prefix("lib").unwrap_or(name);
+                            // Normalize hyphens (final binary names use them; artifacts use _)
+                            let normalized = name.replace('-', "_");
+                            protected_crate_names.insert(normalized);
+                        }
+                    }
+                }
+            }
+            log::debug!(
+                "Protected crate names from {}: {:?}",
+                profile_dir.display(),
+                protected_crate_names
+            );
         }
 
         let mut stats = CleanupStats::default();
@@ -436,23 +291,20 @@ impl CleanCommand {
                 None => continue,
             };
 
-            // Any file sharing a stem with a used artifact is kept
+            // Keep any file sharing a stem with a traced artifact
             if used_stems.contains(&stem) {
                 continue;
             }
 
-            // Skip files that were created/modified during (or after) the trace run —
-            // they are the freshly-produced output artifacts, not stale leftovers.
-            let meta = fs::metadata(&path).await;
-            if let Ok(ref m) = meta {
-                if m.modified().map_or(false, |mtime| mtime >= trace_start) {
-                    continue;
-                }
+            // Keep any file whose crate name matches a current build output
+            // (the root artifact is not in the trace since nothing depends on it)
+            if protected_crate_names.contains(&crate_key(&path)) {
+                continue;
             }
 
             // Unused – mark for removal
-            let size = meta.map(|m| m.len()).unwrap_or(0);
-            let crate_key = crate_key(&path);
+            let size = fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+            let ck = crate_key(&path);
 
             stats.files_to_remove.push(FileToRemove {
                 path: path.clone(),
@@ -461,12 +313,10 @@ impl CleanCommand {
             });
             stats.files += 1;
             stats.bytes += size;
-            let entry = stats.per_crate.entry(crate_key).or_default();
-            entry.files += 1;
-            entry.bytes += size;
-            let profile_entry = stats.per_profile.entry(profile.to_string()).or_default();
-            profile_entry.files += 1;
-            profile_entry.bytes += size;
+            stats.per_crate.entry(ck).or_default().files += 1;
+            stats.per_crate.entry(crate_key(&path)).or_default().bytes += size;
+            stats.per_profile.entry(profile.to_string()).or_default().files += 1;
+            stats.per_profile.entry(profile.to_string()).or_default().bytes += size;
         }
 
         Ok(stats)
@@ -544,176 +394,23 @@ impl CleanCommand {
         Ok(removal_stats)
     }
 
-    async fn process_dep_file(
-        &self,
-        dep: &DepFile,
-        used_package_dirs: &[PathBuf],
-        target_dir: &Path,
-        dry_run: bool,
-        flavor: &str,
-    ) -> Result<Option<CleanupStats>> {
-        // Skip dep files that touch used package dirs.
-        if dep.map.values().any(|deps| {
-            deps.iter().any(|dep| {
-                dep.ancestors().any(|dir| {
-                    used_package_dirs
-                        .iter()
-                        .any(|used_package_dir| used_package_dir == dir)
-                })
-            })
-        }) {
-            return Ok(None);
-        }
-
-        let mut stats = CleanupStats::default();
-
-        for (file, _) in dep.map.iter() {
-            if file.ancestors().all(|dir| dir != target_dir) {
-                return Ok(None);
-            }
-
-            if let Some(ext) = file.extension() {
-                if ext == "rlib" || ext == "rmeta" {
-                    // We only delete rlib and rmeta
-                } else {
-                    return Ok(None);
-                }
-            } else {
-                return Ok(None);
-            }
-
-            if !fs::try_exists(file).await? {
-                return Ok(None);
-            }
-
-            let size = fs::metadata(file).await.map(|m| m.len()).unwrap_or(0);
-            let crate_key = crate_key(file);
-
-            fn update_stats(stats: &mut CleanupStats, crate_key: &str, size: u64) {
-                stats.files += 1;
-                stats.bytes += size;
-                let entry = stats.per_crate.entry(crate_key.to_string()).or_default();
-                entry.files += 1;
-                entry.bytes += size;
-            }
-
-            if dry_run {
-                println!("Would remove {}", file.display());
-                update_stats(&mut stats, &crate_key, size);
-            } else if self.yes {
-                match fs::remove_file(file).await {
-                    Ok(_) => {
-                        update_stats(&mut stats, &crate_key, size);
-                    }
-                    Err(e) => {
-                        stats.errors.insert(
-                            (
-                                crate_key.clone(),
-                                flavor.to_string(),
-                                file.display().to_string(),
-                            ),
-                            e.into(),
-                        );
-                    }
-                };
-            } else {
-                update_stats(&mut stats, &crate_key, size);
-            }
-        }
-        Ok(Some(stats))
-    }
-
-    async fn clean_one_target(
-        &self,
-        used_package_dirs: &[PathBuf],
-        target_dir: &Path,
-        flavor: &str,
-    ) -> Result<CleanupStats> {
-        let base_dir = target_dir.join(flavor);
-
-        if !base_dir.exists() {
-            return Ok(CleanupStats::default());
-        }
-
-        let deps_dir = base_dir.join("deps");
-        if !deps_dir.exists() {
-            log::debug!("Deps directory does not exist: {}", deps_dir.display());
-            return Ok(CleanupStats::default());
-        }
-
-        let dep_files = read_deps_dir(&deps_dir).await.context(format!(
-            "failed to read cargo deps at {}",
-            base_dir.display()
-        ))?;
-
-        let dry_run = self.dry_run;
-
-        let mut stats = try_join_all(dep_files.iter().map(async |dep| {
-            self.process_dep_file(dep, used_package_dirs, target_dir, dry_run, flavor)
-                .await
-                .context("failed to process dep file")
-        }))
-        .await
-        .context("failed to process dep files")?;
-
-        let total_stats = stats
-            .drain(..)
-            .flatten()
-            .fold(CleanupStats::default(), |mut acc, s| {
-                acc.merge_from(s);
-                acc
-            });
-
-        Ok(total_stats)
-    }
-
-    /// Detect available profiles in the target directory
-    async fn detect_profiles(target_dir: &Path) -> Result<Vec<String>> {
-        let mut profiles = Vec::new();
-
-        let mut entries = fs::read_dir(target_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    // Check if it has a deps subdirectory (indicating it's a profile)
-                    let deps_dir = path.join("deps");
-                    if deps_dir.exists() && !name.starts_with('.') {
-                        profiles.push(name.to_string());
-                    }
-                }
-            }
-        }
-
-        profiles.sort();
-        Ok(profiles)
-    }
-
-    /// Show interactive profile selector if no profiles specified
-    fn select_profiles_interactive(available: Vec<String>) -> Result<Vec<String>> {
-        if available.is_empty() {
-            anyhow::bail!("No profiles found in target directory");
-        }
-
-        println!("\n📊 Available profiles in target/:");
-
-        let selections = MultiSelect::with_theme(&ColorfulTheme::default())
-            .with_prompt("Select profiles to clean (Space to select, Enter to confirm)")
-            .items(&available)
-            .defaults(&vec![true; available.len()]) // All selected by default
-            .interact()?;
-
-        if selections.is_empty() {
-            anyhow::bail!("No profiles selected");
-        }
-
-        Ok(selections
-            .into_iter()
-            .map(|i| available[i].clone())
-            .collect())
-    }
-
     pub async fn run(self) -> Result<()> {
+        // Require --command; show a clap-style error with examples if missing
+        if self.custom_command.is_none() {
+            eprintln!("\x1b[1;31merror\x1b[0m: the following required arguments were not provided:");
+            eprintln!("  \x1b[32m-c, --command <COMMAND>\x1b[0m");
+            eprintln!();
+            eprintln!("Examples:");
+            eprintln!("  cargo-clean-artifact -c 'cargo build'");
+            eprintln!("  cargo-clean-artifact -c 'cargo build --release'");
+            eprintln!("  cargo-clean-artifact -c 'cargo build -F my_feat --target wasm32-unknown-unknown'");
+            eprintln!("  cargo-clean-artifact -c 'trunk build'");
+            eprintln!("  cargo-clean-artifact -c 'mise run my-build-task'");
+            eprintln!();
+            eprintln!("For more information, try '\x1b[1m--help\x1b[0m'.");
+            std::process::exit(2);
+        }
+
         if let Ok(target_dir) = env::var("CARGO_TARGET_DIR") {
             let color = std::io::stderr().is_terminal();
             let warn_style = Style::new().fg_color(Some(AnsiColor::Yellow.into())).bold();
@@ -793,13 +490,12 @@ impl CleanCommand {
         // Show detailed summary of what will be removed
         print_detailed_summary(&total_stats);
 
-        // Interactive confirmation if using trace mode and not in --yes mode
-        let should_remove =
-            if (self.check_mode || self.build_mode || self.custom_command.is_some()) && !self.yes {
-                prompt_confirmation(&total_stats)?
-            } else {
-                !self.dry_run || self.yes
-            };
+        // Interactive confirmation if not in --yes mode
+        let should_remove = if !self.yes {
+            prompt_confirmation(&total_stats)?
+        } else {
+            !self.dry_run || self.yes
+        };
 
         if should_remove {
             let removal_stats = self.actually_remove_files(&total_stats).await?;
