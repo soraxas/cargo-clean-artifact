@@ -54,6 +54,16 @@ pub(crate) struct CleanCommand {
     /// Enable verbose output (debug logging).
     #[clap(short = 'v', long = "verbose")]
     verbose: bool,
+
+    /// Print the top N largest in-use artifacts found during tracing.
+    /// Set to 0 to disable.
+    #[clap(
+        long = "trace-stats",
+        short = 'n',
+        value_name = "N",
+        default_value = "5"
+    )]
+    trace_stats: usize,
 }
 
 #[derive(Default)]
@@ -78,6 +88,10 @@ pub(super) struct CrateStat {
 pub(super) struct ProfileStat {
     pub(super) files: usize,
     pub(super) bytes: u64,
+    /// Bytes in deps/ that are kept (in-use)
+    pub(super) used_bytes: u64,
+    /// Total bytes in the entire profile directory (deps + incremental + build + …)
+    pub(super) total_dir_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -101,6 +115,8 @@ impl CleanupStats {
             let entry = self.per_profile.entry(profile).or_default();
             entry.files += stat.files;
             entry.bytes += stat.bytes;
+            entry.used_bytes += stat.used_bytes;
+            entry.total_dir_bytes += stat.total_dir_bytes;
         }
         self.errors.extend(other.errors);
         self.files_to_remove.extend(other.files_to_remove);
@@ -163,14 +179,6 @@ impl CleanCommand {
             .await
             .context("Failed to trace build command")?;
 
-        // Compute in-use size from traced artifacts
-        let mut used_bytes = 0u64;
-        for artifact in &trace_result.used_artifacts {
-            if let Ok(meta) = tokio::fs::metadata(artifact).await {
-                used_bytes += meta.len();
-            }
-        }
-
         // Derive all deps/ directories to scan from the trace result paths.
         // This automatically handles cross-compilation targets like
         // target/wasm32-unknown-unknown/wasm-dev/deps/.
@@ -197,10 +205,66 @@ impl CleanCommand {
             log::debug!("  {} ({})", name, dir.display());
         }
 
-        let mut stats = CleanupStats {
-            used_bytes,
-            ..Default::default()
-        };
+        // Always show which profiles were observed in the trace
+        if scan_dirs.is_empty() {
+            println!("📂 Build profiles: \x1b[2m(none detected)\x1b[0m");
+        } else {
+            let profile_list: Vec<&str> = scan_dirs.iter().map(|(_, p)| p.as_str()).collect();
+            println!(
+                "📂 Build profiles: \x1b[1;36m{}\x1b[0m",
+                profile_list.join("\x1b[0m, \x1b[1;36m")
+            );
+        }
+        println!();
+
+        // in-use artifact breakdown (always shown unless --trace-stats 0)
+        if self.trace_stats > 0 {
+            let n = self.trace_stats;
+            let mut sized: Vec<(PathBuf, u64)> = trace_result
+                .used_artifacts
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok().map(|m| (p.clone(), m.len())))
+                .collect();
+            sized.sort_by(|a, b| b.1.cmp(&a.1));
+            let total = sized.len();
+            let shown = n.min(total);
+            println!(
+                "\x1b[1;33m📦 Top {} in-use artifacts\x1b[0m \x1b[2m({} total):\x1b[0m",
+                shown, total
+            );
+            for (i, (path, size)) in sized.iter().take(n).enumerate() {
+                let rel = path
+                    .strip_prefix(target_dir)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| path.display().to_string());
+                // Strip deps/ prefix for a shorter display: "debug/deps/libfoo…" → "debug libfoo…"
+                let rel_short = rel.replace("/deps/", " ").replace("\\deps\\", " ");
+                // Who uses this artifact?
+                let users: String = trace_result
+                    .used_by
+                    .get(path)
+                    .map(|s| {
+                        let mut v: Vec<&str> = s.iter().map(|x| x.as_str()).collect();
+                        v.sort();
+                        v.truncate(3);
+                        format!(" \x1b[2m← {}\x1b[0m", v.join(", "))
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "  \x1b[2m{:>3}.\x1b[0m \x1b[1m{}\x1b[0m \x1b[32m({})\x1b[0m{}",
+                    i + 1,
+                    rel_short,
+                    format_bytes(*size),
+                    users,
+                );
+            }
+            if total > n {
+                println!("  \x1b[2m  … and {} more in-use files\x1b[0m", total - n);
+            }
+            println!();
+        }
+
+        let mut stats = CleanupStats::default();
         let mut found_any_profile = false;
 
         for (deps_dir, display_profile) in &scan_dirs {
@@ -211,10 +275,20 @@ impl CleanCommand {
 
             found_any_profile = true;
 
-            let profile_stats = self
+            // Total size of the entire profile dir (deps + incremental + build + …)
+            let total_dir_bytes = deps_dir.parent().map(dir_size_bytes).unwrap_or(0);
+
+            let mut profile_stats = self
                 .clean_with_trace_result(deps_dir, &trace_result.used_artifacts, display_profile)
                 .await
                 .context(format!("Failed to clean profile: {display_profile}"))?;
+
+            // Attach total dir size to this profile's stat entry
+            profile_stats
+                .per_profile
+                .entry(display_profile.clone())
+                .or_default()
+                .total_dir_bytes = total_dir_bytes;
 
             stats.merge_from(profile_stats);
         }
@@ -295,12 +369,26 @@ impl CleanCommand {
 
             // Keep any file sharing a stem with a traced artifact
             if used_stems.contains(&stem) {
+                let sz = fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+                stats.used_bytes += sz;
+                stats
+                    .per_profile
+                    .entry(profile.to_string())
+                    .or_default()
+                    .used_bytes += sz;
                 continue;
             }
 
             // Keep any file whose crate name matches a current build output
             // (the root artifact is not in the trace since nothing depends on it)
             if protected_crate_names.contains(&crate_key(&path)) {
+                let sz = fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+                stats.used_bytes += sz;
+                stats
+                    .per_profile
+                    .entry(profile.to_string())
+                    .or_default()
+                    .used_bytes += sz;
                 continue;
             }
 
@@ -332,6 +420,24 @@ impl CleanCommand {
         Ok(stats)
     }
 } // end impl CleanCommand (first block)
+
+/// Recursively sum the size of all files under `dir` (sync, no extra deps).
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                dir_size_bytes(&p)
+            } else {
+                p.metadata().map(|m| m.len()).unwrap_or(0)
+            }
+        })
+        .sum()
+}
 
 /// Extract the `crate_name-HASH` stem from any artifact file:
 /// - `libfoo-HASH.rlib`              → `foo-HASH`
@@ -580,11 +686,21 @@ fn print_detailed_summary(stats: &CleanupStats) {
     if !stats.per_profile.is_empty() {
         println!("{}", paint(color, "By profile:", header_style));
         for (profile, profile_stat) in &stats.per_profile {
+            let total_suffix = if profile_stat.total_dir_bytes > 0 {
+                format!(
+                    "  \x1b[2m[{} kept / {} total dir]\x1b[0m",
+                    format_bytes(profile_stat.used_bytes),
+                    format_bytes(profile_stat.total_dir_bytes),
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "  {} {} files ({})",
+                "  {} {} files ({}){}",
                 paint(color, format!("{profile}:"), profile_style),
                 profile_stat.files,
-                format_bytes(profile_stat.bytes)
+                format_bytes(profile_stat.bytes),
+                total_suffix,
             );
         }
         println!();

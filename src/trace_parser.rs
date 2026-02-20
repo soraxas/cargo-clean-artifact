@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -13,6 +13,8 @@ use crate::crate_deps::format_bytes;
 pub struct TraceResult {
     /// Set of artifact paths that were referenced during the build
     pub used_artifacts: HashSet<PathBuf>,
+    /// Reverse dep map: artifact path → set of crate names that reference it
+    pub used_by: HashMap<PathBuf, HashSet<String>>,
 }
 
 /// Parser for cargo build trace output
@@ -73,7 +75,7 @@ impl TraceParser {
                 stderr_line = stderr_reader.next_line() => {
                     match stderr_line? {
                         Some(line) => {
-                            if let Some(path) = self.extract_artifact_path(&line) {
+                            if let Some((path, target)) = self.extract_artifact_and_target(&line) {
                                 suppress_remaining = 0;
                                 if result.used_artifacts.insert(path.clone()) {
                                     if let Ok(meta) = std::fs::metadata(&path) {
@@ -84,6 +86,9 @@ impl TraceParser {
                                         result.used_artifacts.len(),
                                         format_bytes(total_size),
                                     ));
+                                }
+                                if let Some(t) = target {
+                                    result.used_by.entry(path).or_default().insert(t);
                                 }
                             } else if is_cargo_log_noise(&line, &mut suppress_remaining) {
                                 // Swallow CARGO_LOG trace noise silently
@@ -112,7 +117,7 @@ impl TraceParser {
         println!("\x1b[2m{}\x1b[0m", "─".repeat(width));
 
         println!(
-            "✅ Traced \x1b[1;36m{}\x1b[0m artifacts in use  \x1b[2m({})\x1b[0m",
+            "✅ Traced \x1b[1;36m{}\x1b[0m artifacts  \x1b[2m({} in .rlib/.rmeta)\x1b[0m",
             result.used_artifacts.len(),
             format_bytes(total_size),
         );
@@ -125,8 +130,13 @@ impl TraceParser {
         Ok(result)
     }
 
-    /// Extract an artifact path from a single cargo trace log line.
-    fn extract_artifact_path(&self, line: &str) -> Option<PathBuf> {
+    /// Extract an artifact path (and the crate that references it) from a trace line.
+    ///
+    /// Returns `Some((path, Option<target_crate_name>))`.
+    /// `target_crate_name` is parsed from `target="X"` in the tracing span context,
+    /// giving us the crate that was being fingerprint-checked (i.e. the one that
+    /// depends on the artifact).
+    fn extract_artifact_and_target(&self, line: &str) -> Option<(PathBuf, Option<String>)> {
         if !line.contains("mtime") {
             return None;
         }
@@ -137,19 +147,22 @@ impl TraceParser {
             return None;
         }
 
-        for part in parts.iter().rev() {
-            let path = PathBuf::from(part);
-            if let Some(ext) = path.extension() {
-                let ext_str = ext.to_string_lossy();
-                if matches!(ext_str.as_ref(), "rlib" | "rmeta" | "so" | "dylib" | "dll")
-                    && path.starts_with(&self.target_dir)
-                {
-                    return Some(path);
-                }
-            }
-        }
+        let path = parts.iter().rev().find_map(|part| {
+            let p = PathBuf::from(part);
+            p.extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .filter(|e| matches!(e.as_str(), "rlib" | "rmeta" | "so" | "dylib" | "dll"))
+                .filter(|_| p.starts_with(&self.target_dir))
+                .map(|_| p)
+        })?;
 
-        None
+        // Parse target="crate_name" from the tracing span prefix
+        let target = line.find("target=\"").and_then(|i| {
+            let rest = &line[i + 8..];
+            rest.find('"').map(|j| rest[..j].to_string())
+        });
+
+        Some((path, target))
     }
 }
 
