@@ -62,6 +62,8 @@ impl TraceParser {
         spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
         let mut total_size: u64 = 0;
+        let mut suppress_remaining: u8 = 0;
+        let mut last_line_was_blank = false;
 
         loop {
             tokio::select! {
@@ -72,6 +74,7 @@ impl TraceParser {
                     match stderr_line? {
                         Some(line) => {
                             if let Some(path) = self.extract_artifact_path(&line) {
+                                suppress_remaining = 0;
                                 if result.used_artifacts.insert(path.clone()) {
                                     if let Ok(meta) = std::fs::metadata(&path) {
                                         total_size += meta.len();
@@ -82,11 +85,15 @@ impl TraceParser {
                                         format_bytes(total_size),
                                     ));
                                 }
-                            } else if !line.contains("cargo::core::compiler::fingerprint:")
-                                && !line.trim().is_empty()
-                            {
-                                // Normal cargo output (Compiling, Finished, …) — print above spinner
-                                spinner.println(&line);
+                            } else if is_cargo_log_noise(&line, &mut suppress_remaining) {
+                                // Swallow CARGO_LOG trace noise silently
+                            } else {
+                                // Real cargo output (Compiling, warnings, errors, …)
+                                let is_blank = line.trim().is_empty();
+                                if !(is_blank && last_line_was_blank) {
+                                    spinner.println(&line);
+                                }
+                                last_line_was_blank = is_blank;
                             }
                         }
                         None => break,
@@ -144,6 +151,42 @@ impl TraceParser {
 
         None
     }
+}
+
+/// Returns `true` (and updates `suppress_remaining`) when a stderr line is
+/// CARGO_LOG trace noise that should be hidden from the user.
+///
+/// Three categories of noise from `CARGO_LOG=…=trace`:
+///   1. Structured log entries — always contain `cargo::` (the module path).
+///   2. `Caused by:` — anyhow error-chain header when cargo can't stat a
+///      not-yet-built artifact during fingerprint checks.
+///   3. The body after `Caused by:` — e.g. `    No such file or directory`.
+///      We suppress exactly `suppress_remaining` non-empty lines after the
+///      header (count-based, not indentation-based, so `   Compiling …`
+///      lines that also start with spaces are never swallowed).
+fn is_cargo_log_noise(line: &str, suppress_remaining: &mut u8) -> bool {
+    // Consume a suppressed body line (one line per "Caused by:" header)
+    if *suppress_remaining > 0 && !line.trim().is_empty() {
+        *suppress_remaining -= 1;
+        return true;
+    }
+
+    if line.trim().is_empty() {
+        return false;
+    }
+
+    // Structured CARGO_LOG trace entries always contain the module path
+    if line.contains("cargo::") {
+        return true;
+    }
+
+    // anyhow error-chain header — suppress the next non-empty body line
+    if line.trim_start().starts_with("Caused by:") {
+        *suppress_remaining = 1;
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]

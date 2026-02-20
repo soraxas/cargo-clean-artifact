@@ -15,7 +15,9 @@ build requires zero recompilation.
 ## Installation
 
 ```sh
-cargo install cargo-clean-artifact
+cargo install --git https://github.com/soraxas/cargo-clean-artifact
+# or
+mise use -g github:soraxas/cargo-clean-artifact
 ```
 
 ## Usage
