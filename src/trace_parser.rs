@@ -55,9 +55,7 @@ impl TraceParser {
         spinner.set_style(
             ProgressStyle::default_spinner()
                 .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
-                .template(concat!(
-                    "\x1b[44;1;97m {spinner} Tracing \x1b[0;34m\u{e0b0}\x1b[0;36m  {msg}  \x1b[0m"
-                ))
+                .template("\u{1b}[44;1;97m {spinner} Tracing \u{1b}[0;34m\u{e0b0}\u{1b}[0;36m  {msg}  \u{1b}[0m")
                 .unwrap(),
         );
         spinner.set_message("scanning…");
@@ -68,10 +66,7 @@ impl TraceParser {
         loop {
             tokio::select! {
                 stdout_line = stdout_reader.next_line() => {
-                    match stdout_line? {
-                        Some(line) => { spinner.println(&line); }
-                        None => {}
-                    }
+                    if let Some(line) = stdout_line? { spinner.println(&line); }
                 }
                 stderr_line = stderr_reader.next_line() => {
                     match stderr_line? {
@@ -163,14 +158,18 @@ mod tests {
             r#"max output mtime for "foo" is "/project/target/debug/deps/libfoo-abc123.rlib" 123s"#;
         assert_eq!(
             parser.extract_artifact_path(line),
-            Some(PathBuf::from("/project/target/debug/deps/libfoo-abc123.rlib"))
+            Some(PathBuf::from(
+                "/project/target/debug/deps/libfoo-abc123.rlib"
+            ))
         );
 
         let line =
             r#"max dep mtime for "bar" is "/project/target/debug/deps/libbar-xyz789.rmeta" 456s"#;
         assert_eq!(
             parser.extract_artifact_path(line),
-            Some(PathBuf::from("/project/target/debug/deps/libbar-xyz789.rmeta"))
+            Some(PathBuf::from(
+                "/project/target/debug/deps/libbar-xyz789.rmeta"
+            ))
         );
 
         let line = "Some other log line without artifacts";

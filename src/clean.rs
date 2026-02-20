@@ -122,9 +122,7 @@ impl CleanCommand {
     ) -> Result<CleanupStats> {
         let cmd = self.custom_command.as_deref().expect("command required");
 
-        let metadata = MetadataCommand::new()
-            .current_dir(git_dir)
-            .exec();
+        let metadata = MetadataCommand::new().current_dir(git_dir).exec();
 
         let metadata = match metadata {
             Ok(metadata) => metadata,
@@ -178,20 +176,19 @@ impl CleanCommand {
         // target/wasm32-unknown-unknown/wasm-dev/deps/.
         let mut scan_dirs: Vec<(PathBuf, String)> = Vec::new(); // (path, display_profile)
         for artifact in &trace_result.used_artifacts {
-            if let Some(parent) = artifact.parent() {
-                if parent.file_name().map_or(false, |n| n == "deps")
-                    && parent.starts_with(target_dir)
-                    && !scan_dirs.iter().any(|(d, _)| d == parent)
-                {
-                    // Display name: strip target_dir prefix and trailing "/deps"
-                    let display = parent
-                        .strip_prefix(target_dir)
-                        .ok()
-                        .and_then(|p| p.parent()) // drop "deps" component
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    scan_dirs.push((parent.to_path_buf(), display));
-                }
+            if let Some(parent) = artifact.parent()
+                && parent.file_name().is_some_and(|n| n == "deps")
+                && parent.starts_with(target_dir)
+                && !scan_dirs.iter().any(|(d, _)| d == parent)
+            {
+                // Display name: strip target_dir prefix and trailing "/deps"
+                let display = parent
+                    .strip_prefix(target_dir)
+                    .ok()
+                    .and_then(|p| p.parent()) // drop "deps" component
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".to_string());
+                scan_dirs.push((parent.to_path_buf(), display));
             }
         }
 
@@ -200,7 +197,10 @@ impl CleanCommand {
             log::debug!("  {} ({})", name, dir.display());
         }
 
-        let mut stats = CleanupStats { used_bytes, ..Default::default() };
+        let mut stats = CleanupStats {
+            used_bytes,
+            ..Default::default()
+        };
         let mut found_any_profile = false;
 
         for (deps_dir, display_profile) in &scan_dirs {
@@ -221,7 +221,9 @@ impl CleanCommand {
 
         if !found_any_profile {
             eprintln!("⚠️  Warning: No traced artifact directories found.");
-            eprintln!("   Make sure your build command produces output in the cargo target directory.");
+            eprintln!(
+                "   Make sure your build command produces output in the cargo target directory."
+            );
             eprintln!("   Target directory: {}", target_dir.display());
         }
 
@@ -243,10 +245,10 @@ impl CleanCommand {
         // Build the set of used stems from artifacts that live in this deps dir
         let mut used_stems: std::collections::HashSet<String> = std::collections::HashSet::new();
         for artifact in used_artifacts {
-            if artifact.parent() == Some(deps_dir) {
-                if let Some(stem) = artifact_stem(artifact) {
-                    used_stems.insert(stem);
-                }
+            if artifact.parent() == Some(deps_dir)
+                && let Some(stem) = artifact_stem(artifact)
+            {
+                used_stems.insert(stem);
             }
         }
 
@@ -259,13 +261,13 @@ impl CleanCommand {
             if let Ok(mut profile_entries) = fs::read_dir(profile_dir).await {
                 while let Some(pe) = profile_entries.next_entry().await.ok().flatten() {
                     let p = pe.path();
-                    if p.is_file() {
-                        if let Some(name) = p.file_stem().and_then(|s| s.to_str()) {
-                            let name = name.strip_prefix("lib").unwrap_or(name);
-                            // Normalize hyphens (final binary names use them; artifacts use _)
-                            let normalized = name.replace('-', "_");
-                            protected_crate_names.insert(normalized);
-                        }
+                    if p.is_file()
+                        && let Some(name) = p.file_stem().and_then(|s| s.to_str())
+                    {
+                        let name = name.strip_prefix("lib").unwrap_or(name);
+                        // Normalize hyphens (final binary names use them; artifacts use _)
+                        let normalized = name.replace('-', "_");
+                        protected_crate_names.insert(normalized);
                     }
                 }
             }
@@ -315,8 +317,16 @@ impl CleanCommand {
             stats.bytes += size;
             stats.per_crate.entry(ck).or_default().files += 1;
             stats.per_crate.entry(crate_key(&path)).or_default().bytes += size;
-            stats.per_profile.entry(profile.to_string()).or_default().files += 1;
-            stats.per_profile.entry(profile.to_string()).or_default().bytes += size;
+            stats
+                .per_profile
+                .entry(profile.to_string())
+                .or_default()
+                .files += 1;
+            stats
+                .per_profile
+                .entry(profile.to_string())
+                .or_default()
+                .bytes += size;
         }
 
         Ok(stats)
@@ -397,13 +407,17 @@ impl CleanCommand {
     pub async fn run(self) -> Result<()> {
         // Require --command; show a clap-style error with examples if missing
         if self.custom_command.is_none() {
-            eprintln!("\x1b[1;31merror\x1b[0m: the following required arguments were not provided:");
+            eprintln!(
+                "\x1b[1;31merror\x1b[0m: the following required arguments were not provided:"
+            );
             eprintln!("  \x1b[32m-c, --command <COMMAND>\x1b[0m");
             eprintln!();
             eprintln!("Examples:");
             eprintln!("  cargo-clean-artifact -c 'cargo build'");
             eprintln!("  cargo-clean-artifact -c 'cargo build --release'");
-            eprintln!("  cargo-clean-artifact -c 'cargo build -F my_feat --target wasm32-unknown-unknown'");
+            eprintln!(
+                "  cargo-clean-artifact -c 'cargo build -F my_feat --target wasm32-unknown-unknown'"
+            );
             eprintln!("  cargo-clean-artifact -c 'trunk build'");
             eprintln!("  cargo-clean-artifact -c 'mise run my-build-task'");
             eprintln!();
