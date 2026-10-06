@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-clean-artifact"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anstyle",
  "anyhow",
@@ -141,6 +141,7 @@ dependencies = [
  "futures",
  "indicatif",
  "log",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

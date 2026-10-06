@@ -16,12 +16,14 @@ use tokio::fs;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::crate_deps::{crate_key, paint};
+use crate::detect::detect_commands;
 use crate::trace_parser::TraceParser;
 
 mod display;
 mod prompt;
 mod scan;
 mod stats;
+mod workspaces;
 
 use display::{
     print_detailed_summary, print_dry_run_summary, print_profile_breakdown, print_removal_summary,
@@ -62,6 +64,15 @@ pub(crate) struct CleanCommand {
     /// Passed to `sh -c`, so quoting and spaces work as normal.
     #[clap(short = 'c', long = "command", value_name = "COMMAND")]
     custom_command: Option<String>,
+
+    /// Print inferred build commands (newest first) without building or cleaning.
+    #[clap(long, conflicts_with_all = ["custom_command", "yes", "dry_run"])]
+    detect: bool,
+
+    /// Recursively search DIR for cargo projects (a Cargo.toml next to a target/)
+    /// and pick which one to clean from an interactive list, like `cargo sweep`.
+    #[clap(short = 'r', long, conflicts_with = "detect")]
+    recursive: bool,
 
     /// Enable verbose output (debug logging).
     #[clap(short = 'v', long = "verbose")]
@@ -179,7 +190,7 @@ impl CleanCommand {
                 .iter()
                 .filter_map(|p| std::fs::metadata(p).ok().map(|m| (p.clone(), m.len())))
                 .collect();
-            sized.sort_by(|a, b| b.1.cmp(&a.1));
+            sized.sort_by_key(|a| std::cmp::Reverse(a.1));
             let total = sized.len();
             let shown = n.min(total);
             println!(
@@ -303,31 +314,15 @@ impl CleanCommand {
             }
         }
 
-        // Build a set of current output crate names from files directly in the
-        // parent profile directory (e.g. target/release/).  Files there are the
-        // final build outputs — keep their corresponding deps/ intermediates.
-        let mut protected_crate_names: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        if let Some(profile_dir) = deps_dir.parent() {
-            if let Ok(mut profile_entries) = fs::read_dir(profile_dir).await {
-                while let Some(pe) = profile_entries.next_entry().await.ok().flatten() {
-                    let p = pe.path();
-                    if p.is_file()
-                        && let Some(name) = p.file_stem().and_then(|s| s.to_str())
-                    {
-                        let name = name.strip_prefix("lib").unwrap_or(name);
-                        // Normalize hyphens (final binary names use them; artifacts use _)
-                        let normalized = name.replace('-', "_");
-                        protected_crate_names.insert(normalized);
-                    }
-                }
-            }
-            log::debug!(
-                "Protected crate names from {}: {:?}",
-                profile_dir.display(),
-                protected_crate_names
-            );
-        }
+        // Stems of the current final outputs (binary / lib / wasm in the parent
+        // profile dir). The root artifact is not in the trace since nothing
+        // depends on it. Only the live hash is protected, not older rebuilds.
+        let protected_stems = scan::current_output_stems(deps_dir);
+        log::debug!(
+            "Protected stems in {}: {:?}",
+            deps_dir.display(),
+            protected_stems
+        );
 
         let mut stats = CleanupStats::default();
         let mut entries = fs::read_dir(deps_dir).await?;
@@ -356,9 +351,8 @@ impl CleanCommand {
                 continue;
             }
 
-            // Keep any file whose crate name matches a current build output
-            // (the root artifact is not in the trace since nothing depends on it)
-            if protected_crate_names.contains(&crate_key(&path)) {
+            // Keep files belonging to the current build output
+            if protected_stems.contains(&stem) {
                 let sz = fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
                 stats.used_bytes += sz;
                 stats
@@ -446,7 +440,7 @@ impl CleanCommand {
                 continue;
             }
             // Sort newest first
-            sessions.sort_by(|a, b| b.1.cmp(&a.1));
+            sessions.sort_by_key(|a| std::cmp::Reverse(a.1));
             // Keep index 0 (newest), remove the rest
             for (path, _) in sessions.into_iter().skip(1) {
                 let size = dir_size_bytes(&path);
@@ -560,11 +554,42 @@ impl CleanCommand {
     }
 
     pub async fn run(self) -> Result<()> {
+        if self.recursive {
+            return self.run_recursive().await;
+        }
+        if self.detect {
+            let commands = detect_commands(&self.dir)?;
+            if commands.is_empty() {
+                eprintln!(
+                    "No build commands could be inferred from existing workspace fingerprints."
+                );
+            } else {
+                eprintln!(
+                    "Inferred build commands, newest first (not exact historical invocations):"
+                );
+                for command in commands {
+                    println!("{}", command.command);
+                }
+            }
+            return Ok(());
+        }
+
         // Resolve the build command (interactive picker when -c is absent on a TTY)
         let resolved_cmd: Option<String> = if self.custom_command.is_some() {
             self.custom_command.clone()
         } else {
-            match select_command_interactive()? {
+            let detected = if std::io::stderr().is_terminal() {
+                match detect_commands(&self.dir) {
+                    Ok(commands) => commands,
+                    Err(error) => {
+                        log::warn!("Could not detect build commands: {error}");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            match select_command_interactive(&detected)? {
                 Some(cmd) => Some(cmd),
                 None => {
                     eprintln!(
@@ -580,6 +605,9 @@ impl CleanCommand {
                     );
                     eprintln!("  cargo-clean-artifact -c 'trunk build'");
                     eprintln!("  cargo-clean-artifact -c 'mise run my-build-task'");
+                    eprintln!(
+                        "  cargo-clean-artifact --detect  # infer commands without running them"
+                    );
                     eprintln!();
                     eprintln!("For more information, try '\x1b[1m--help\x1b[0m'.");
                     std::process::exit(2);
@@ -690,5 +718,62 @@ impl CleanCommand {
         }
 
         Ok(())
+    }
+
+    /// Recursive mode: discover cargo projects, let the user pick one, run the
+    /// regular cleanup on it, then come back to the list.
+    async fn run_recursive(&self) -> Result<()> {
+        use workspaces::{Action, discover, measure, pick, remove_target};
+
+        if !std::io::stderr().is_terminal() {
+            anyhow::bail!("--recursive needs an interactive terminal");
+        }
+        let root = self.dir.canonicalize().unwrap_or_else(|_| self.dir.clone());
+        eprintln!("Searching {} for cargo projects…", root.display());
+        let mut found = discover(&root);
+        measure(&mut found);
+        if found.is_empty() {
+            eprintln!(
+                "No cargo projects with a target/ directory found under {}.",
+                root.display()
+            );
+            return Ok(());
+        }
+
+        let mut selected = 0;
+        loop {
+            match pick(&root, &found, &mut selected)? {
+                Action::Quit => return Ok(()),
+                Action::SmartClean(dir) => {
+                    let mut sub = self.clone();
+                    sub.recursive = false;
+                    sub.dir = dir.clone();
+                    if let Err(e) = Box::pin(sub.run()).await {
+                        eprintln!("\x1b[1;31merror\x1b[0m: {e:#}");
+                    }
+                    if let Some(ws) = found.iter_mut().find(|w| w.dir == dir) {
+                        ws.size = scan::folder_size_estimate(&ws.target).bytes;
+                    }
+                }
+                Action::RemoveTarget(dir) => {
+                    if self.dry_run {
+                        eprintln!("--dry-run: not removing {}/target", dir.display());
+                    } else if let Some(i) = found.iter().position(|w| w.dir == dir) {
+                        match remove_target(&found[i]) {
+                            Ok(0) => {}
+                            Ok(freed) => {
+                                eprintln!("Freed {}", crate::crate_deps::format_bytes(freed));
+                                found.remove(i);
+                            }
+                            Err(e) => eprintln!("\x1b[1;31merror\x1b[0m: {e:#}"),
+                        }
+                    }
+                    if found.is_empty() {
+                        return Ok(());
+                    }
+                }
+            }
+            found.sort_by_key(|w| std::cmp::Reverse(w.size));
+        }
     }
 }

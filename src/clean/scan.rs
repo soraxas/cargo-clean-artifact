@@ -1,21 +1,135 @@
 use std::path::Path;
 
-/// Recursively sum the size of all files under `dir` (sync, no extra deps).
-pub(super) fn dir_size_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(|e| e.ok())
-        .map(|e| {
-            let p = e.path();
-            if p.is_dir() {
-                dir_size_bytes(&p)
-            } else {
-                p.metadata().map(|m| m.len()).unwrap_or(0)
+#[derive(Clone, Copy, Default)]
+pub(super) struct FolderSizeEstimate {
+    pub(super) bytes: u64,
+    pub(super) incomplete: bool,
+}
+
+/// Inspect metadata only, counting each hardlinked inode once on Unix. Symlinks
+/// contribute their own allocation but are never followed into other folders.
+pub(super) fn folder_size_estimate(root: &Path) -> FolderSizeEstimate {
+    let mut estimate = FolderSizeEstimate::default();
+    let mut pending = vec![root.to_path_buf()];
+    #[cfg(unix)]
+    let mut seen = std::collections::HashSet::new();
+    while let Some(path) = pending.pop() {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            estimate.incomplete = true;
+            continue;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if !seen.insert((metadata.dev(), metadata.ino())) {
+                continue;
             }
-        })
-        .sum()
+            estimate.bytes = estimate
+                .bytes
+                .saturating_add(metadata.blocks().saturating_mul(512));
+        }
+        #[cfg(not(unix))]
+        if metadata.is_file() {
+            estimate.bytes = estimate.bytes.saturating_add(metadata.len());
+        }
+        if metadata.is_dir() {
+            match std::fs::read_dir(&path) {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok(entry) => pending.push(entry.path()),
+                            Err(_) => estimate.incomplete = true,
+                        }
+                    }
+                }
+                Err(_) => estimate.incomplete = true,
+            }
+        }
+    }
+    estimate
+}
+
+/// Disk usage of `dir` (hardlinks counted once, symlinks not followed).
+pub(super) fn dir_size_bytes(dir: &Path) -> u64 {
+    folder_size_estimate(dir).bytes
+}
+
+/// Stems (`crate-HASH`) in `deps_dir` that are the *current* final outputs.
+///
+/// Cargo hardlinks final outputs from `<profile>/` (and `<profile>/examples/`)
+/// to `deps/`, so a deps file sharing an inode with a profile-level file is the
+/// live one. Crates with no inode match (e.g. copied outputs) fall back to
+/// their newest stem by mtime. Older hashes of the same crate are NOT
+/// protected, so they can be reclaimed.
+#[cfg(unix)]
+pub(super) fn current_output_stems(deps_dir: &Path) -> std::collections::HashSet<String> {
+    use std::collections::{HashMap, HashSet};
+    use std::os::unix::fs::MetadataExt;
+    use std::time::SystemTime;
+
+    let mut stems = HashSet::new();
+    let Some(profile_dir) = deps_dir.parent() else {
+        return stems;
+    };
+
+    // (dev, ino) of every plain file in the profile dir and examples/
+    let mut live_inodes = HashSet::new();
+    let mut live_names = HashSet::new();
+    for dir in [profile_dir.to_path_buf(), profile_dir.join("examples")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+                continue;
+            };
+            if m.is_file() {
+                live_inodes.insert((m.dev(), m.ino()));
+                live_names.insert(crate::crate_deps::crate_key(&e.path()).replace('-', "_"));
+            }
+        }
+    }
+
+    let mut matched_names = HashSet::new();
+    let mut newest: HashMap<String, (SystemTime, String)> = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(deps_dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            let Some(stem) = artifact_stem(&path) else {
+                continue;
+            };
+            let Ok(m) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !m.is_file() {
+                continue;
+            }
+            let key = crate::crate_deps::crate_key(&path);
+            if live_inodes.contains(&(m.dev(), m.ino())) {
+                stems.insert(stem.clone());
+                matched_names.insert(key.clone());
+            }
+            let mtime = m.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let slot = newest.entry(key).or_insert((mtime, stem.clone()));
+            if mtime > slot.0 {
+                *slot = (mtime, stem);
+            }
+        }
+    }
+
+    for name in live_names {
+        if !matched_names.contains(&name)
+            && let Some((_, stem)) = newest.get(&name)
+        {
+            stems.insert(stem.clone());
+        }
+    }
+    stems
+}
+
+#[cfg(not(unix))]
+pub(super) fn current_output_stems(_deps_dir: &Path) -> std::collections::HashSet<String> {
+    std::collections::HashSet::new()
 }
 
 /// Extract the `crate_name-HASH` stem from any artifact file:
@@ -41,9 +155,73 @@ pub(super) fn artifact_stem(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn current_output_stems_protects_only_live_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        let deps = profile.join("deps");
+        fs::create_dir_all(&deps).unwrap();
+        fs::write(deps.join("libapp-old1.rlib"), b"old").unwrap();
+        fs::write(deps.join("libapp-live.rlib"), b"live").unwrap();
+        fs::write(deps.join("app-live.o"), b"o").unwrap();
+        fs::hard_link(deps.join("libapp-live.rlib"), profile.join("libapp.rlib")).unwrap();
+        let stems = current_output_stems(&deps);
+        assert!(stems.contains("app-live"));
+        assert!(!stems.contains("app-old1"));
+    }
     use std::fs;
     use std::path::Path;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn folder_estimate_includes_nested_artifacts_and_ignores_other_profiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        fs::create_dir_all(profile.join("deps")).unwrap();
+        fs::write(profile.join("deps/first.rlib"), vec![1u8; 8192]).unwrap();
+        let first = folder_size_estimate(&profile);
+        assert!(first.bytes >= 8192);
+        assert!(!first.incomplete);
+        fs::create_dir_all(tmp.path().join("release")).unwrap();
+        fs::write(tmp.path().join("release/other.rlib"), vec![1u8; 16384]).unwrap();
+        assert_eq!(folder_size_estimate(&profile).bytes, first.bytes);
+        fs::write(profile.join("deps/second.rlib"), vec![2u8; 8192]).unwrap();
+        assert!(folder_size_estimate(&profile).bytes > first.bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_estimate_does_not_double_count_hardlinks_or_follow_symlinks() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        fs::create_dir(&profile).unwrap();
+        fs::write(profile.join("artifact"), vec![1u8; 8192]).unwrap();
+        fs::hard_link(profile.join("artifact"), profile.join("artifact-copy")).unwrap();
+        fs::write(tmp.path().join("outside"), vec![2u8; 32768]).unwrap();
+        symlink(tmp.path().join("outside"), profile.join("outside-link")).unwrap();
+        symlink(&profile, profile.join("cycle")).unwrap();
+        let expected: u64 = [
+            &profile,
+            &profile.join("artifact"),
+            &profile.join("outside-link"),
+            &profile.join("cycle"),
+        ]
+        .into_iter()
+        .map(|p| fs::symlink_metadata(p).unwrap().blocks() * 512)
+        .sum();
+        let estimate = folder_size_estimate(&profile);
+        assert_eq!(estimate.bytes, expected);
+        assert!(!estimate.incomplete);
+    }
+
+    #[test]
+    fn missing_folder_size_is_not_reported_as_a_complete_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(folder_size_estimate(&tmp.path().join("missing")).incomplete);
+    }
 
     // ── artifact_stem ─────────────────────────────────────────────────────────
 
